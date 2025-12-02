@@ -2,6 +2,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dji.sampleV5.aircraft">
 
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+
     <!-- Sample permission requirement -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 <!--    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />-->
@@ -14,6 +18,10 @@
 
     <!-- 自安装使用 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!--    for video sharing -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
 
     <!-- Google Maps -->
     <meta-data
@@ -68,6 +76,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name="dji.sampleV5.aircraft.TouchFlyActivity"
+            android:theme="@style/full_screen_theme"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false" />
 
         <activity android:name=".UsbAttachActivity"
             android:theme="@style/translucent_theme"

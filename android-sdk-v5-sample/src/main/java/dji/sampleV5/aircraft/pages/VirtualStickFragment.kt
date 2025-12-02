@@ -21,6 +21,8 @@ import dji.v5.common.error.IDJIError
 import dji.v5.manager.aircraft.virtualstick.Stick
 import dji.v5.utils.common.JsonUtil
 import kotlin.math.abs
+import android.content.Intent
+import dji.sampleV5.aircraft.TouchFlyActivity
 
 /**
  * Class Description
@@ -90,7 +92,6 @@ class VirtualStickFragment : DJIFragment() {
                 override fun onSuccess() {
                     ToastUtils.showToast("disableVirtualStick success.")
                 }
-
                 override fun onFailure(error: IDJIError) {
                     ToastUtils.showToast("disableVirtualStick error,${error})")
                 }
@@ -155,6 +156,11 @@ class VirtualStickFragment : DJIFragment() {
             virtualStickVM.virtualStickAdvancedParam.value?.let {
                 virtualStickVM.sendVirtualStickAdvancedParam(it)
             }
+
+            //pressing this button to launch TouchFlyActivity
+            val ctx = requireContext()
+            val intent = Intent(ctx, TouchFlyActivity::class.java)
+            ctx.startActivity(intent)
         }
         binding?.btnEnableVirtualStickAdvancedMode?.setOnClickListener {
             virtualStickVM.enableVirtualStickAdvancedMode()
