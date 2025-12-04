@@ -57,11 +57,19 @@ import dji.sdk.keyvalue.key.BatteryKey
 import dji.sdk.keyvalue.key.DJIKey
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
-
-
+import dji.sdk.keyvalue.key.AirLinkKey
+import dji.sdk.keyvalue.key.RemoteControllerKey
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.os.Build
 
 
 private const val TAG = "TouchFly"
+
+enum class LinkQuality {
+    GOOD, FAIR, POOR, CRITICAL
+}
 
 class TouchFlyActivity : AppCompatActivity() {
 
@@ -115,6 +123,7 @@ class TouchFlyActivity : AppCompatActivity() {
     private lateinit var btnRecordStart: Button
     private lateinit var btnRecordStop: Button
 
+
     private lateinit var btnTakeOff: Button
     private lateinit var btnRth: Button
 
@@ -129,6 +138,13 @@ class TouchFlyActivity : AppCompatActivity() {
     private lateinit var batteryTv: TextView
     private lateinit var batteryPercentKey: DJIKey<Int>
 
+    private lateinit var tvDroneLink: TextView
+    private lateinit var tvPhoneNet: TextView
+    private lateinit var tvPilotNet: TextView
+    private lateinit var rcConnectionKey: DJIKey<Boolean>
+    private lateinit var airlinkSignalQualityKey: DJIKey<Int>
+    private lateinit var connectivityManager: ConnectivityManager
+    private var phoneNetCallback: ConnectivityManager.NetworkCallback? = null
     // key indicator views
     private lateinit var indicatorZoomIn: View
     private lateinit var indicatorZoomOut: View
@@ -141,11 +157,26 @@ class TouchFlyActivity : AppCompatActivity() {
     private var gimbalLevel = 0.0
 
 
-
+    @Volatile private var droneLinkQuality: LinkQuality = LinkQuality.GOOD
+    @Volatile private var phoneNetQuality: LinkQuality = LinkQuality.GOOD
+    @Volatile private var pilotNetQuality: LinkQuality = LinkQuality.GOOD
 
     @Volatile
     private var isScreenShareOn = false
+    @Volatile
+    private var isRecording = false
 
+
+    @Volatile private var lastPilotControlMs: Long = 0L
+    @Volatile private var lastPilotHeartbeatMs: Long = 0L
+    @Volatile private var rthTriggeredForCritical = false
+    @Volatile private var firstCriticalSeenAtMs: Long = 0L
+    private val safetyHandler = Handler(Looper.getMainLooper())
+    private var safetyLoopStarted = false
+
+    private val DEADMAN_TIMEOUT_MS = 120000L          // no control input → hover
+    private val HEARTBEAT_LOST_MS = 60000L         // no any messages → pilot net "lost"
+    private val RTH_CRITICAL_HOLD_MS = 150000L
 
     private val screenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -260,6 +291,11 @@ class TouchFlyActivity : AppCompatActivity() {
         rightStickView = findViewById(R.id.right_stick_view)
 
         batteryTv = findViewById(R.id.tv_battery)
+
+        tvDroneLink = findViewById(R.id.tv_drone_link)
+        tvPhoneNet = findViewById(R.id.tv_phone_net)
+        tvPilotNet = findViewById(R.id.tv_pilot_net)
+
         indicatorZoomIn = findViewById(R.id.indicator_zoom_in)
         indicatorZoomOut = findViewById(R.id.indicator_zoom_out)
         indicatorTakeoff = findViewById(R.id.indicator_takeoff)
@@ -334,6 +370,13 @@ class TouchFlyActivity : AppCompatActivity() {
         btnStop = findViewById(R.id.btn_send_virtual_stick_advanced_param)
         btnStop?.text = "STOP"
 
+        val now = System.currentTimeMillis()
+        lastPilotControlMs = now
+        lastPilotHeartbeatMs = now
+        startSafetyLoop()
+
+
+
         logToUi("TouchFlyActivity started")
 
         setupTouchControls()
@@ -342,28 +385,254 @@ class TouchFlyActivity : AppCompatActivity() {
         initCameraStreamPreview()
         initZoomControls()
         initBatteryPercentage()
-
+        initDroneLinkMonitoring()
+        initPhoneNetMonitoring()
         setupLiveKitFromIntent()
+    }
+    override fun onResume() {
+        super.onResume()
+        logToUi("TouchFlyActivity onResume()")
+
+        if (cameraStreamSurface != null && cameraStreamWidth > 0 && cameraStreamHeight > 0) {
+            logToUi("onResume: re-attaching camera stream to existing surface")
+            putCameraStreamSurface("onResume")
+        } else {
+            logToUi("onResume: no valid surface yet (w=$cameraStreamWidth h=$cameraStreamHeight)")
+        }
     }
 
 
+    override fun onDestroy() {
+        super.onDestroy()
+        if (isRecording) {
+            logToUi("TouchFlyActivity destroying → attempting to STOP recording automatically.")
+            stopRecordingToSd()
+        }
 
-    // --- DJI camera preview wiring (adapted from LiveFragment.kt) ---
+        sending = false
+        sendHandler.removeCallbacksAndMessages(null)
+
+        try {
+            KeyManager.getInstance().cancelListen(batteryPercentKey, this)
+        } catch (_: Exception) { }
+
+        try {
+            KeyManager.getInstance().cancelListen(airlinkSignalQualityKey, this)
+        } catch (_: Exception) { }
+
+        try {
+            KeyManager.getInstance().cancelListen(rcConnectionKey, this)
+        } catch (_: Exception) { }
+
+        try {
+            if (::connectivityManager.isInitialized && phoneNetCallback != null) {
+                connectivityManager.unregisterNetworkCallback(phoneNetCallback!!)
+                phoneNetCallback = null
+            }
+        } catch (_: Exception) { }
+
+
+        livekitScope.launch{
+            try{
+                livekitRoom?.localParticipant?.setScreenShareEnabled(false)
+            } catch(_:Exception){}
+        }
+        safetyHandler.removeCallbacksAndMessages(null)
+        safetyLoopStarted = false
+
+        removeCameraStreamSurface()
+        livekitScope.cancel()
+        livekitRoom?.disconnect()
+
+        livekitRoom = null
+    }
+
+    private fun initDroneLinkMonitoring() {
+        // Prepare keys
+        rcConnectionKey = RemoteControllerKey.KeyConnection.create()
+        airlinkSignalQualityKey = AirLinkKey.KeySignalQuality.create()
+
+        val km = KeyManager.getInstance()
+
+        // Get initial signal quality value once
+        km.getValue(
+            airlinkSignalQualityKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<Int> {
+                override fun onSuccess(value: Int) {
+                    logToUi("Initial airlink signal quality: $value")
+                    runOnUiThread {
+                        updateDroneLinkUi(value)
+                    }
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi(
+                        "Failed to read airlink signal quality: " +
+                                "${error.errorCode()} ${error.description()}"
+                    )
+                    runOnUiThread {
+                        updateDroneLinkUi(null)
+                    }
+                }
+            }
+        )
+
+        //Listen for live updates to signal quality (0–100)
+        km.listen(
+            airlinkSignalQualityKey,
+            this
+        ) { _, newValue ->
+            runOnUiThread {
+                updateDroneLinkUi(newValue)
+            }
+        }
+
+        //Listen for RC connection status
+        km.listen(
+            rcConnectionKey,
+            this
+        ) { _, newValue ->
+            val connected = newValue == true
+            if (!connected) {
+                droneLinkQuality = LinkQuality.CRITICAL
+                runOnUiThread {
+                    setQualityLabel(
+                        tvDroneLink,
+                        "DRONE LINK: DISCONNECTED",
+                        LinkQuality.CRITICAL
+                    )
+                }
+            }
+        }
+    }
+
+    private fun startSafetyLoop() {
+        if (safetyLoopStarted) return
+        safetyLoopStarted = true
+
+        val task = object : Runnable {
+            override fun run() {
+                val now = System.currentTimeMillis()
+
+                //DEAD-MAN: no control for a short window → neutral sticks
+                if (sending) {
+                    val sinceControl = now - lastPilotControlMs
+                    if (sinceControl > DEADMAN_TIMEOUT_MS &&
+                        (pitchInput != 0.0 || rollInput != 0.0 || yawInput != 0.0 || throttleInput != 0.0)
+                    ) {
+                        pitchInput = 0.0
+                        rollInput = 0.0
+                        yawInput = 0.0
+                        throttleInput = 0.0
+
+                        logToUi(
+                            "SAFETY: no pilot control for ${sinceControl}ms → " +
+                                    "neutral sticks (hover)."
+                        )
+
+                        runOnUiThread {
+                            updateJoystickFromInputs()
+                        }
+                    }
+                }
+
+                // HEARTBEAT: no messages from pilot at all → mark pilot net CRITICAL
+                val sinceHeartbeat = now - lastPilotHeartbeatMs
+                if (sinceHeartbeat > HEARTBEAT_LOST_MS) {
+                    if (pilotNetQuality != LinkQuality.CRITICAL) {
+                        pilotNetQuality = LinkQuality.CRITICAL
+                        runOnUiThread {
+                            setQualityLabel(
+                                tvPilotNet,
+                                "PILOT NET: LOST (${sinceHeartbeat / 1000}s)",
+                                LinkQuality.CRITICAL
+                            )
+                        }
+                        logToUi("SAFETY: pilot heartbeat lost for ${sinceHeartbeat}ms.")
+                    }
+                }
+
+                //LINK-BASED SAFETY: if any link is bad, force hover; if CRITICAL for a while, RTH.
+                val worst = worstLinkQuality()
+
+                // If link degraded to POOR or worse, force hover (even if pilot is still holding keys)
+                if (sending && (worst == LinkQuality.POOR || worst == LinkQuality.CRITICAL)) {
+                    if (pitchInput != 0.0 || rollInput != 0.0 ||
+                        yawInput != 0.0 || throttleInput != 0.0
+                    ) {
+                        pitchInput = 0.0
+                        rollInput = 0.0
+                        yawInput = 0.0
+                        throttleInput = 0.0
+
+                        logToUi("SAFETY: worst link=$worst → forcing hover.")
+                        runOnUiThread { updateJoystickFromInputs() }
+                    }
+                }
+
+                // Track how long we’ve been in CRITICAL
+                if (worst == LinkQuality.CRITICAL) {
+                    if (firstCriticalSeenAtMs == 0L) {
+                        firstCriticalSeenAtMs = now
+                    }
+                    val inCriticalMs = now - firstCriticalSeenAtMs
+
+                    if (!rthTriggeredForCritical && inCriticalMs >= RTH_CRITICAL_HOLD_MS) {
+                        logToUi(
+                            "SAFETY: worst link CRITICAL for ${inCriticalMs}ms → " +
+                                    "auto Return-to-Home."
+                        )
+                        startSdkReturnToHome()
+                        rthTriggeredForCritical = true
+                    }
+                } else {
+                    // reset when we leave CRITICAL
+                    firstCriticalSeenAtMs = 0L
+                    rthTriggeredForCritical = false
+                }
+
+                // schedule next check
+                safetyHandler.postDelayed(this, 200L) // 5 Hz
+            }
+        }
+
+        safetyHandler.post(task)
+    }
+
+
+    // --- DJI camera preview wiring (hardened + logged) ---
     private fun initCameraStreamPreview() {
-        // Listen for Surface lifecycle
+        logToUi("initCameraStreamPreview: attaching SurfaceHolder.Callback")
+
         cameraSurface.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
+                logToUi("Surface CREATED for camera preview")
+                cameraStreamWidth = holder.surfaceFrame.width()
+                cameraStreamHeight = holder.surfaceFrame.height()
+                cameraStreamSurface = holder.surface
+                putCameraStreamSurface("surfaceCreated")
             }
 
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+            override fun surfaceChanged(
+                holder: SurfaceHolder,
+                format: Int,
+                width: Int,
+                height: Int
+            ) {
+                logToUi("Surface CHANGED: w=$width h=$height fmt=$format")
                 cameraStreamWidth = width
                 cameraStreamHeight = height
                 cameraStreamSurface = holder.surface
-                putCameraStreamSurface()
+                putCameraStreamSurface("surfaceChanged")
             }
 
             override fun surfaceDestroyed(holder: SurfaceHolder) {
-                cameraStreamManager.removeCameraStreamSurface(holder.surface)
+                logToUi("Surface DESTROYED, removing camera stream surface")
+                try {
+                    cameraStreamManager.removeCameraStreamSurface(holder.surface)
+                } catch (e: Exception) {
+                    logToUi("removeCameraStreamSurface in surfaceDestroyed failed: ${e.message}")
+                }
             }
         })
 
@@ -372,14 +641,50 @@ class TouchFlyActivity : AppCompatActivity() {
 
         // Set default camera index (main camera)
         cameraIndex = ComponentIndexType.LEFT_OR_MAIN
+        logToUi("initCameraStreamPreview: cameraIndex set to $cameraIndex")
+
+        // If the SurfaceView is already laid out when we arrive (common after re-entry), force an attach anyway.
+        cameraSurface.post {
+            val w = cameraSurface.width
+            val h = cameraSurface.height
+            if (w > 0 && h > 0) {
+                cameraStreamWidth = w
+                cameraStreamHeight = h
+                cameraStreamSurface = cameraSurface.holder.surface
+                logToUi("initCameraStreamPreview: post() attach w=$w h=$h")
+                putCameraStreamSurface("init-post")
+            } else {
+                logToUi("initCameraStreamPreview: post() w/h are 0, will rely on callbacks")
+            }
+        }
     }
 
-    //Tell DJI to draw the selected camera into SurfaceView
-    private fun putCameraStreamSurface() {
-        if (!isLocalLiveShow) return
-        if (cameraIndex == ComponentIndexType.UNKNOWN) return
+    // Tell DJI to draw the selected camera into SurfaceView
+    private fun putCameraStreamSurface(from: String) {
+        logToUi(
+            "putCameraStreamSurface(from=$from) " +
+                    "isLocalLiveShow=$isLocalLiveShow " +
+                    "cameraIndex=$cameraIndex " +
+                    "w=$cameraStreamWidth h=$cameraStreamHeight " +
+                    "surfaceIsNull=${cameraStreamSurface == null}"
+        )
+
+        if (!isLocalLiveShow) {
+            logToUi("putCameraStreamSurface: local live show disabled, returning")
+            return
+        }
+        if (cameraIndex == ComponentIndexType.UNKNOWN) {
+            logToUi("putCameraStreamSurface: cameraIndex UNKNOWN, returning")
+            return
+        }
 
         cameraStreamSurface?.let { surface ->
+            // defensive: clear any old binding on this surface before reattaching
+            try {
+                cameraStreamManager.removeCameraStreamSurface(surface)
+            } catch (_: Exception) {
+            }
+
             cameraStreamManager.putCameraStreamSurface(
                 cameraIndex,
                 surface,
@@ -387,9 +692,12 @@ class TouchFlyActivity : AppCompatActivity() {
                 cameraStreamHeight,
                 cameraStreamScaleType
             )
-            logToUi("Camera stream attached: $cameraIndex ${cameraStreamWidth}x$cameraStreamHeight")
+            logToUi("Camera stream attached OK: $cameraIndex ${cameraStreamWidth}x$cameraStreamHeight")
+        } ?: run {
+            logToUi("putCameraStreamSurface: surface is NULL, can't attach")
         }
     }
+
 
     //Remove this surface from DJI camera stream manager
     private fun removeCameraStreamSurface() {
@@ -398,27 +706,7 @@ class TouchFlyActivity : AppCompatActivity() {
         }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        sending = false
-        sendHandler.removeCallbacksAndMessages(null)
 
-        try {
-            KeyManager.getInstance().cancelListen(batteryPercentKey, this)
-        } catch (_: Exception) { }
-
-        livekitScope.launch{
-            try{
-                livekitRoom?.localParticipant?.setScreenShareEnabled(false)
-            } catch(_:Exception){}
-        }
-
-        removeCameraStreamSurface()
-        livekitScope.cancel()
-        livekitRoom?.disconnect()
-
-        livekitRoom = null
-    }
 
     // Helper: log to both Logcat and virtual_stick_info_tv
     private fun logToUi(message: String) {
@@ -519,10 +807,12 @@ class TouchFlyActivity : AppCompatActivity() {
             EmptyMsg(),
             object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
                 override fun onSuccess(result: EmptyMsg?) {
+                    isRecording = true
                     logToUi("Recording STARTED (SDK)")
                 }
 
                 override fun onFailure(error: IDJIError) {
+                    isRecording = false
                     logToUi("Failed to start recording: ${error.errorCode()} ${error.description()}")
                 }
             }
@@ -542,6 +832,7 @@ class TouchFlyActivity : AppCompatActivity() {
             EmptyMsg(),
             object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
                 override fun onSuccess(result: EmptyMsg?) {
+                    isRecording = false
                     logToUi("Recording STOPPED (SDK)")
                 }
 
@@ -551,6 +842,30 @@ class TouchFlyActivity : AppCompatActivity() {
             }
         )
     }
+
+    private fun takePhotoToSd() {
+        logToUi("Photo capture requested…")
+
+        val cameraIndex = 0
+
+        val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
+            KeyTools.createKey(CameraKey.KeyStartShootPhoto, cameraIndex)
+
+        KeyManager.getInstance().performAction(
+            actionKey,
+            EmptyMsg(),
+            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
+                override fun onSuccess(result: EmptyMsg?) {
+                    logToUi("PHOTO captured (SDK)")
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi("Failed to capture photo: ${error.errorCode()} ${error.description()}")
+                }
+            }
+        )
+    }
+
 
     private fun startSdkTakeoff() {
         logToUi("Takeoff requested (FlightControllerKey.KeyStartTakeoff)…")
@@ -654,6 +969,64 @@ class TouchFlyActivity : AppCompatActivity() {
             }
         )
     }
+
+    private fun initPhoneNetMonitoring() {
+        connectivityManager =
+            getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+        // Initial snapshot using active network, if any
+        try {
+            val activeNetwork = connectivityManager.activeNetwork
+            val caps = connectivityManager.getNetworkCapabilities(activeNetwork)
+            runOnUiThread {
+                updatePhoneNetFromCapabilities(caps)
+            }
+        } catch (e: Exception) {
+            logToUi("PhoneNet: failed to read initial capabilities: ${e.message}")
+            runOnUiThread {
+                updatePhoneNetUi(0, 0, hasInternet = false)
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            // Use default network callback on modern Android
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    try {
+                        val caps = connectivityManager.getNetworkCapabilities(network)
+                        runOnUiThread {
+                            updatePhoneNetFromCapabilities(caps)
+                        }
+                    } catch (e: Exception) {
+                        logToUi("PhoneNet: onAvailable error: ${e.message}")
+                    }
+                }
+
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities
+                ) {
+                    runOnUiThread {
+                        updatePhoneNetFromCapabilities(networkCapabilities)
+                    }
+                }
+
+                override fun onLost(network: Network) {
+                    runOnUiThread {
+                        updatePhoneNetUi(0, 0, hasInternet = false)
+                    }
+                }
+            }
+
+            phoneNetCallback = cb
+            connectivityManager.registerDefaultNetworkCallback(cb)
+            logToUi("PhoneNet: registered default network callback.")
+        } else {
+            // Older devices: we just rely on the initial snapshot
+            logToUi("PhoneNet: SDK < 24, using single activeNetwork snapshot only.")
+        }
+    }
+
 
     private fun changeZoom(step: Double) {
         val target = (zoomCurrent + step).coerceIn(zoomMin, zoomMax)
@@ -761,6 +1134,174 @@ class TouchFlyActivity : AppCompatActivity() {
             )
         }
     }
+    private fun setQualityLabel(
+        tv: TextView,
+        label: String,
+        quality: LinkQuality?
+    ) {
+        tv.text = label
+        val color = when (quality) {
+            LinkQuality.GOOD     -> Color.GREEN          // solid green
+            LinkQuality.FAIR     -> Color.YELLOW         // yellow
+            LinkQuality.POOR     -> Color.parseColor("#FF9800") // orange
+            LinkQuality.CRITICAL -> Color.RED            // red
+            null                      -> Color.GRAY
+        }
+        tv.setTextColor(color)
+    }
+    private fun worstLinkQuality(): LinkQuality {
+        return listOf(droneLinkQuality, phoneNetQuality, pilotNetQuality)
+            .maxByOrNull { it.ordinal } ?: LinkQuality.GOOD
+    }
+
+
+    private fun updateDroneLinkUi(quality: Int?) {
+        if (quality == null) {
+            setQualityLabel(tvDroneLink, "DRONE LINK: ---", null)
+            return
+        }
+
+        // Map 0–100 to quality levels:
+        // GOOD:     60–100
+        // FAIR:     40–59
+        // POOR:     25–39
+        // CRITICAL: 0–24
+        val level = when {
+            quality >= 60 -> LinkQuality.GOOD
+            quality >= 40 -> LinkQuality.FAIR
+            quality >= 25 -> LinkQuality.POOR
+            else          -> LinkQuality.CRITICAL
+        }
+
+        droneLinkQuality = level
+
+        val label = when (level) {
+            LinkQuality.GOOD     -> "DRONE LINK: GOOD"
+            LinkQuality.FAIR     -> "DRONE LINK: FAIR"
+            LinkQuality.POOR     -> "DRONE LINK: POOR"
+            LinkQuality.CRITICAL -> "DRONE LINK: CRITICAL"
+        }
+
+        setQualityLabel(tvDroneLink, label, level)
+    }
+
+    private fun updatePhoneNetUi(downKbps: Int, upKbps: Int, hasInternet: Boolean) {
+        val level = mapPhoneNetToLevel(downKbps, upKbps, hasInternet)
+        phoneNetQuality = level
+
+        val label = when (level) {
+            LinkQuality.GOOD ->
+                "PHONE NET: GOOD"
+            LinkQuality.FAIR ->
+                "PHONE NET: FAIR"
+            LinkQuality.POOR ->
+                "PHONE NET: POOR"
+            LinkQuality.CRITICAL ->
+                "PHONE NET: CRITICAL"
+        }
+
+        setQualityLabel(tvPhoneNet, label, level)
+    }
+
+    private fun updatePilotNetUi(bitrateKbps: Int, rttMs: Int) {
+        val level = mapPilotNetToLevel(bitrateKbps, rttMs)
+        pilotNetQuality = level
+
+        val bitratePart = if (bitrateKbps < 0) "N/A" else "${bitrateKbps}kbps"
+
+        val label = when (level) {
+            LinkQuality.GOOD ->
+                "PILOT NET: GOOD"
+            LinkQuality.FAIR ->
+                "PILOT NET: FAIR"
+            LinkQuality.POOR ->
+                "PILOT NET: POOR"
+            LinkQuality.CRITICAL ->
+                "PILOT NET: CRITICAL"
+        }
+
+        setQualityLabel(tvPilotNet, label, level)
+    }
+
+    private fun updatePhoneNetFromCapabilities(caps: NetworkCapabilities?) {
+        if (caps == null) {
+            updatePhoneNetUi(0, 0, hasInternet = false)
+            return
+        }
+
+        val hasInternet =
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+
+        val downKbps = caps.linkDownstreamBandwidthKbps
+        val upKbps   = caps.linkUpstreamBandwidthKbps
+
+        updatePhoneNetUi(downKbps, upKbps, hasInternet)
+    }
+
+    private fun mapPhoneNetToLevel(downKbps: Int, upKbps: Int, hasInternet: Boolean): LinkQuality {
+        if (!hasInternet || (downKbps == 0 && upKbps == 0)) {
+            return LinkQuality.CRITICAL
+        }
+
+        return when {
+            // GOOD: enough for HD video + solid control
+            downKbps >= 3000 && upKbps >= 1000 -> LinkQuality.GOOD
+
+            // FAIR: OK for control, video may degrade
+            downKbps >= 1500 && upKbps >= 500 -> LinkQuality.FAIR
+
+            // POOR: noticeable lag, borderline for safe remote flying
+            downKbps >= 500 && upKbps >= 200   -> LinkQuality.POOR
+
+            // Below this is CRITICAL
+            else -> LinkQuality.CRITICAL
+        }
+    }
+
+    /**
+     * Map pilot's network (from browser WebRTC stats) to a LinkQualityLevel.
+     *
+     * bitrateKbps: outgoing bitrate from pilot to LiveKit.
+     * rttMs: round-trip time in ms.
+     */
+    private fun mapPilotNetToLevel(bitrateKbps: Int, rttMs: Int): LinkQuality {
+        val hasRtt = rttMs > 0
+        val hasBitrate = bitrateKbps > 0
+
+        if (!hasRtt && !hasBitrate) {
+            return LinkQuality.CRITICAL
+        }
+
+        fun levelFromRtt(rtt: Int): LinkQuality =
+            when {
+                rtt < 120 -> LinkQuality.GOOD
+                rtt < 200 -> LinkQuality.FAIR
+                rtt < 350 -> LinkQuality.POOR
+                else      -> LinkQuality.CRITICAL
+            }
+
+        fun levelFromBitrate(br: Int): LinkQuality =
+            when {
+                br >= 1500 -> LinkQuality.GOOD
+                br >= 700  -> LinkQuality.FAIR
+                br >= 300  -> LinkQuality.POOR
+                else       -> LinkQuality.CRITICAL
+            }
+
+        return when {
+            hasRtt && !hasBitrate -> levelFromRtt(rttMs)
+            !hasRtt && hasBitrate -> levelFromBitrate(bitrateKbps)
+            else -> {
+                val rttLevel = levelFromRtt(rttMs)
+                val brLevel  = levelFromBitrate(bitrateKbps)
+                // take the worse one (CRITICAL is "worst")
+                if (rttLevel.ordinal >= brLevel.ordinal) rttLevel else brLevel
+            }
+        }
+    }
+
+
 
 
 
@@ -820,7 +1361,6 @@ class TouchFlyActivity : AppCompatActivity() {
 
     private suspend fun fetchTokenFromServer(
         role: String = "android",
-
         //room variable taken out for git
     ): String? {
         val url = "https://skymind.live/api/token?role=$role&room=$room"
@@ -885,7 +1425,8 @@ class TouchFlyActivity : AppCompatActivity() {
     private fun handleLiveKitData(event: RoomEvent.DataReceived) {
         val raw = String(event.data, Charsets.UTF_8)
         logToUi("LiveKit data received: $raw")
-
+        val now = System.currentTimeMillis()
+        lastPilotHeartbeatMs = now
         try {
             val obj = JSONObject(raw)
             when (obj.optString("type", "")) {
@@ -894,17 +1435,27 @@ class TouchFlyActivity : AppCompatActivity() {
                     val roll = obj.optDouble("roll", 0.0)
                     val yaw = obj.optDouble("yaw", 0.0)
                     val throttle = obj.optDouble("throttle", 0.0)
+                    lastPilotControlMs = now
                     applyRemoteStick(pitch, roll, yaw, throttle)
                 }
                 "key" -> {
                     val code = obj.optString("code", "")
                     val down = obj.optBoolean("down", false)
                     logToUi("Key from pilot: code=$code down=$down")
+                    lastPilotControlMs = now
                     mapKeyToStick(code, down)
                 }
                 "command" -> {
                     val cmd = obj.optString("cmd", "")
                     logToUi("Received command: $cmd")
+                }
+                "pilot_net_quality" -> {
+                    val rtt = obj.optInt("rttMs", -1)
+                    val bitRate = obj.optInt("bitrateKbps", -1)
+                    logToUi("Pilot net stats: rtt=${rtt}ms, bitrate=${bitRate}kbps")
+                    runOnUiThread {
+                        updatePilotNetUi(bitRate,rtt)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -971,8 +1522,20 @@ class TouchFlyActivity : AppCompatActivity() {
                 startSdkReturnToHome()
             }
             "L", "KEYL" -> if(down){
-                logToUi("Pilot requestion LAND (L)")
+                logToUi("Pilot requested LAND (L)")
                 startSdkLanding()
+            }
+            "N", "KEYN" -> if(down){
+                logToUi("Pilot requested START RECORDING (N)")
+                startRecordingToSd()
+            }
+            "M","KEYM" -> if(down){
+                logToUi("Pilot requested STOP RECORDING (M)")
+                stopRecordingToSd()
+            }
+            "P","KEYP" -> if(down){
+                logToUi("Pilot requested PHOTO CAPTURE (P)")
+                takePhotoToSd()
             }
 
             else -> { /* ignore */ }

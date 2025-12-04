@@ -203,6 +203,42 @@
             app:layout_constraintEnd_toEndOf="parent"
             android:layout_marginTop="8dp"
             android:layout_marginEnd="8dp" />
+        <TextView
+            android:id="@+id/tv_drone_link"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="DRONE LINK: ---"
+            android:textColor="@android:color/darker_gray"
+            android:textSize="14sp"
+            android:layout_marginEnd="8dp"
+            app:layout_constraintTop_toTopOf="@id/tv_battery"
+            app:layout_constraintBottom_toBottomOf="@id/tv_battery"
+            app:layout_constraintEnd_toStartOf="@id/tv_phone_net" />
+
+        <TextView
+            android:id="@+id/tv_phone_net"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="PHONE NET: ---"
+            android:textColor="@android:color/darker_gray"
+            android:textSize="14sp"
+            android:layout_marginEnd="8dp"
+            app:layout_constraintTop_toTopOf="@id/tv_battery"
+            app:layout_constraintBottom_toBottomOf="@id/tv_battery"
+            app:layout_constraintEnd_toStartOf="@id/tv_pilot_net" />
+
+        <TextView
+            android:id="@+id/tv_pilot_net"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="PILOT NET: ---"
+            android:textColor="@android:color/darker_gray"
+            android:textSize="14sp"
+            android:layout_marginEnd="8dp"
+            app:layout_constraintTop_toTopOf="@id/tv_battery"
+            app:layout_constraintBottom_toBottomOf="@id/tv_battery"
+            app:layout_constraintEnd_toStartOf="@id/tv_battery" />
+
 
         <TextView
             android:id="@+id/indicator_zoom_in"
@@ -229,8 +265,9 @@
             android:gravity="center"
             app:layout_constraintTop_toTopOf="@id/tv_battery"
             app:layout_constraintBottom_toBottomOf="@id/tv_battery"
-            app:layout_constraintEnd_toStartOf="@id/tv_battery"
+            app:layout_constraintEnd_toStartOf="@id/tv_drone_link"
             android:layout_marginEnd="4dp" />
+
 
 
         <!-- T / R / L indicators below the battery (column) -->
