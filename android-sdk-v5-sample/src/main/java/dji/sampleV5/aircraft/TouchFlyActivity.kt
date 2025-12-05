@@ -47,7 +47,6 @@ import dji.sdk.keyvalue.value.gimbal.GimbalAngleRotationMode
 import dji.sdk.keyvalue.value.common.EmptyMsg
 
 import dji.sdk.keyvalue.key.CameraKey
-import dji.sdk.keyvalue.key.DJICameraKey.KeyStopRecord
 import dji.sdk.keyvalue.key.FlightControllerKey
 import dji.v5.et.action
 import dji.v5.et.create
@@ -63,6 +62,9 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
+import dji.sdk.keyvalue.value.camera.CameraMode
+import dji.sdk.keyvalue.value.flightcontroller.GPSSignalLevel
+import dji.sdk.keyvalue.value.camera.CameraStorageLocation
 
 
 private const val TAG = "TouchFly"
@@ -101,7 +103,18 @@ class TouchFlyActivity : AppCompatActivity() {
     private var cameraStreamScaleType: ICameraStreamManager.ScaleType =
         ICameraStreamManager.ScaleType.CENTER_INSIDE
     private var cameraIndex: ComponentIndexType = ComponentIndexType.LEFT_OR_MAIN
+    private val mainLens: CameraLensType = CameraLensType.CAMERA_LENS_DEFAULT
     private var isLocalLiveShow: Boolean = true
+
+    // --- Flight status (GPS + home point) ---
+    @Volatile private var lastGpsLevel: GPSSignalLevel = GPSSignalLevel.LEVEL_0
+    @Volatile private var lastHomeSet: Boolean = false
+
+    private lateinit var gpsSignalKey: DJIKey<GPSSignalLevel>
+    private lateinit var homeSetKey: DJIKey<Boolean>
+
+    private lateinit var uxRecordWidget: dji.v5.ux.cameracore.widget.cameracapture.recordvideo.RecordVideoWidget
+    private lateinit var uxShootWidget: dji.v5.ux.cameracore.widget.cameracapture.shootphoto.ShootPhotoWidget
 
 
     // Normalized joystick inputs [-1, 1]
@@ -119,9 +132,9 @@ class TouchFlyActivity : AppCompatActivity() {
 
     private lateinit var btnStartStream: Button
     private lateinit var btnStopStream: Button
-
-    private lateinit var btnRecordStart: Button
-    private lateinit var btnRecordStop: Button
+//
+//    private lateinit var btnRecordStart: Button
+//    private lateinit var btnRecordStop: Button
 
 
     private lateinit var btnTakeOff: Button
@@ -152,6 +165,18 @@ class TouchFlyActivity : AppCompatActivity() {
     private lateinit var indicatorRth: View
     private lateinit var indicatorLand: View
 
+    private lateinit var indicatorVideoStart: View
+    private lateinit var indicatorVideoStop: View
+
+    private lateinit var indicatorPicture: View
+
+    private val shootPhotoNotAllowedKey: DJIKey<Boolean> =
+        KeyTools.createCameraKey(
+            CameraKey.KeyShootPhotoNotAllowed,
+            cameraIndex,
+            mainLens
+        )
+
     private lateinit var gimbalTrack: View
     private lateinit var gimbalThumb: View
     private var gimbalLevel = 0.0
@@ -174,8 +199,8 @@ class TouchFlyActivity : AppCompatActivity() {
     private val safetyHandler = Handler(Looper.getMainLooper())
     private var safetyLoopStarted = false
 
-    private val DEADMAN_TIMEOUT_MS = 120000L          // no control input → hover
-    private val HEARTBEAT_LOST_MS = 60000L         // no any messages → pilot net "lost"
+    private val DEADMAN_TIMEOUT_MS = 120000L // no control input → hover
+    private val HEARTBEAT_LOST_MS = 60000L // no any messages → pilot net "lost"
     private val RTH_CRITICAL_HOLD_MS = 150000L
 
     private val screenCaptureLauncher = registerForActivityResult(
@@ -188,8 +213,6 @@ class TouchFlyActivity : AppCompatActivity() {
             logToUi("Screen share: permission denied or cancelled")
             return@registerForActivityResult
         }
-
-        // Got the MediaProjection resultData --> LiveKit to starts to screen share
         startScreenShareWithLiveKit(data)
     }
 
@@ -301,6 +324,11 @@ class TouchFlyActivity : AppCompatActivity() {
         indicatorTakeoff = findViewById(R.id.indicator_takeoff)
         indicatorRth = findViewById(R.id.indicator_rth)
         indicatorLand = findViewById(R.id.indicator_land)
+
+        indicatorVideoStart = findViewById(R.id.indicator_video_start)
+        indicatorVideoStop = findViewById(R.id.indicator_video_stop)
+
+        indicatorPicture = findViewById(R.id.indicator_picture)
         gimbalTrack = findViewById(R.id.gimbal_slider_track)
         gimbalThumb = findViewById(R.id.gimbal_slider_thumb)
         updateGimbalSliderUi()
@@ -325,9 +353,17 @@ class TouchFlyActivity : AppCompatActivity() {
         tvLogs = findViewById(R.id.tvLogs)
         btnStartStream = findViewById(R.id.btn_start_stream)
         btnStopStream = findViewById(R.id.btn_stop_stream)
-        btnRecordStart = findViewById(R.id.btn_record_start)
-        btnRecordStop = findViewById(R.id.btn_record_stop)
+//        btnRecordStart = findViewById(R.id.btn_record_start)
+//        btnRecordStop = findViewById(R.id.btn_record_stop)
+        uxRecordWidget = findViewById(R.id.ux_record_widget)
+        uxShootWidget = findViewById(R.id.ux_shoot_widget)
 
+        uxRecordWidget.updateCameraSource(
+            ComponentIndexType.LEFT_OR_MAIN, CameraLensType.CAMERA_LENS_DEFAULT
+        )
+        uxShootWidget.updateCameraSource(
+            ComponentIndexType.LEFT_OR_MAIN, CameraLensType.CAMERA_LENS_DEFAULT
+        )
         btnStartStream.setOnClickListener {
             requestScreenShare()
         }
@@ -336,13 +372,13 @@ class TouchFlyActivity : AppCompatActivity() {
             stopScreenShare()
         }
 
-        btnRecordStart.setOnClickListener {
-            startRecordingToSd()
-        }
-
-        btnRecordStop.setOnClickListener {
-            stopRecordingToSd()
-        }
+//        btnRecordStart.setOnClickListener {
+//            startRecordingToSd()
+//        }
+//
+//        btnRecordStop.setOnClickListener {
+//            stopRecordingToSd()
+//        }
 
         rootView.setOnLongClickListener {
             toggleCleanMode()
@@ -357,7 +393,6 @@ class TouchFlyActivity : AppCompatActivity() {
 
         btnRth.setOnClickListener {
             startSdkReturnToHome()
-            // pure auto-landing--> call startSdkAutoLanding()
         }
 
         btnLand.setOnClickListener {
@@ -385,6 +420,7 @@ class TouchFlyActivity : AppCompatActivity() {
         initCameraStreamPreview()
         initZoomControls()
         initBatteryPercentage()
+        initFlightStatusMonitoring()
         initDroneLinkMonitoring()
         initPhoneNetMonitoring()
         setupLiveKitFromIntent()
@@ -506,6 +542,72 @@ class TouchFlyActivity : AppCompatActivity() {
         }
     }
 
+    private fun initFlightStatusMonitoring() {
+        val km = KeyManager.getInstance()
+
+        // GPS signal level (0–5; higher = better)
+        gpsSignalKey = KeyTools.createKey(FlightControllerKey.KeyGPSSignalLevel)
+
+        km.getValue(
+            gpsSignalKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<GPSSignalLevel> {
+                override fun onSuccess(value: GPSSignalLevel) {
+                    lastGpsLevel = value
+                    logToUi("Flight status init: GPSSignalLevel = ${value.name} (ordinal=${value.ordinal})")
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi(
+                        "Flight status init: failed to read GPSSignalLevel: " +
+                                "${error.errorCode()} ${error.description()}"
+                    )
+                }
+            }
+        )
+
+        km.listen(
+            gpsSignalKey,
+            this
+        ) { _, newValue ->
+            newValue?.let {
+                lastGpsLevel = it
+                logToUi("Flight status update: GPSSignalLevel = ${it.name} (ordinal=${it.ordinal})")
+            }
+        }
+
+        // home point set
+        homeSetKey = KeyTools.createKey(FlightControllerKey.KeyIsHomeLocationSet)
+
+        km.getValue(
+            homeSetKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<Boolean> {
+                override fun onSuccess(isSet: Boolean) {
+                    lastHomeSet = isSet
+                    logToUi("Flight status init: HomeLocationSet = $isSet")
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi(
+                        "Flight status init: failed to read HomeLocationSet: " +
+                                "${error.errorCode()} ${error.description()}"
+                    )
+                }
+            }
+        )
+
+        km.listen(
+            homeSetKey,
+            this
+        ) { _, newValue ->
+            newValue?.let {
+                lastHomeSet = it
+                logToUi("Flight status update: HomeLocationSet = $it")
+            }
+        }
+    }
+
+
+
     private fun startSafetyLoop() {
         if (safetyLoopStarted) return
         safetyLoopStarted = true
@@ -514,7 +616,7 @@ class TouchFlyActivity : AppCompatActivity() {
             override fun run() {
                 val now = System.currentTimeMillis()
 
-                //DEAD-MAN: no control for a short window → neutral sticks
+                //dead man timeout
                 if (sending) {
                     val sinceControl = now - lastPilotControlMs
                     if (sinceControl > DEADMAN_TIMEOUT_MS &&
@@ -536,7 +638,7 @@ class TouchFlyActivity : AppCompatActivity() {
                     }
                 }
 
-                // HEARTBEAT: no messages from pilot at all → mark pilot net CRITICAL
+                // messages from pilot
                 val sinceHeartbeat = now - lastPilotHeartbeatMs
                 if (sinceHeartbeat > HEARTBEAT_LOST_MS) {
                     if (pilotNetQuality != LinkQuality.CRITICAL) {
@@ -552,10 +654,10 @@ class TouchFlyActivity : AppCompatActivity() {
                     }
                 }
 
-                //LINK-BASED SAFETY: if any link is bad, force hover; if CRITICAL for a while, RTH.
+                //link connection
                 val worst = worstLinkQuality()
 
-                // If link degraded to POOR or worse, force hover (even if pilot is still holding keys)
+                // If link degraded to POOR or worse, force hover
                 if (sending && (worst == LinkQuality.POOR || worst == LinkQuality.CRITICAL)) {
                     if (pitchInput != 0.0 || rollInput != 0.0 ||
                         yawInput != 0.0 || throttleInput != 0.0
@@ -643,7 +745,7 @@ class TouchFlyActivity : AppCompatActivity() {
         cameraIndex = ComponentIndexType.LEFT_OR_MAIN
         logToUi("initCameraStreamPreview: cameraIndex set to $cameraIndex")
 
-        // If the SurfaceView is already laid out when we arrive (common after re-entry), force an attach anyway.
+        // If the SurfaceView is already laid out when we arrive, force an attach anyway.
         cameraSurface.post {
             val w = cameraSurface.width
             val h = cameraSurface.height
@@ -679,7 +781,7 @@ class TouchFlyActivity : AppCompatActivity() {
         }
 
         cameraStreamSurface?.let { surface ->
-            // defensive: clear any old binding on this surface before reattaching
+            //clear any old binding on this surface before reattaching
             try {
                 cameraStreamManager.removeCameraStreamSurface(surface)
             } catch (_: Exception) {
@@ -705,6 +807,38 @@ class TouchFlyActivity : AppCompatActivity() {
             cameraStreamManager.removeCameraStreamSurface(it)
         }
     }
+
+    private fun setCameraMode(
+        mode: CameraMode,
+        onDone: (Boolean, IDJIError?) -> Unit
+    ) {
+        // *******for mini 4 pro: use camera + lens specific key
+        val modeKey: DJIKey<CameraMode> = KeyTools.createCameraKey(
+            CameraKey.KeyCameraMode,
+            cameraIndex,
+            mainLens
+        )
+
+        KeyManager.getInstance().setValue(
+            modeKey,
+            mode,
+            object : CommonCallbacks.CompletionCallback {
+                override fun onSuccess() {
+                    logToUi("Camera mode set to $mode (index=$cameraIndex, lens=$mainLens)")
+                    onDone(true, null)
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi(
+                        "Failed to set camera mode to $mode: " +
+                                "${error.errorCode()} ${error.description()}"
+                    )
+                    onDone(false, error)
+                }
+            }
+        )
+    }
+
 
 
 
@@ -797,35 +931,48 @@ class TouchFlyActivity : AppCompatActivity() {
     private fun startRecordingToSd() {
         logToUi("Start recording requested…")
 
-        val cameraIndex = 0
-
-        val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
-            KeyTools.createKey(CameraKey.KeyStartRecord, cameraIndex)
-
-        KeyManager.getInstance().performAction(
-            actionKey,
-            EmptyMsg(),
-            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
-                override fun onSuccess(result: EmptyMsg?) {
-                    isRecording = true
-                    logToUi("Recording STARTED (SDK)")
-                }
-
-                override fun onFailure(error: IDJIError) {
-                    isRecording = false
-                    logToUi("Failed to start recording: ${error.errorCode()} ${error.description()}")
-                }
+        setCameraMode(CameraMode.VIDEO_NORMAL) { ok, err ->
+            if (!ok) {
+                logToUi(
+                    "Cannot start recording, camera mode change failed: " +
+                            "${err?.errorCode()} ${err?.description()}"
+                )
+                return@setCameraMode
             }
-        )
+
+            val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
+                KeyTools.createKey(CameraKey.KeyStartRecord, cameraIndex) //mainCameraIndex?
+
+            KeyManager.getInstance().performAction(
+                actionKey,
+                EmptyMsg(),
+                object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
+                    override fun onSuccess(result: EmptyMsg?) {
+                        isRecording = true
+                        logToUi("Recording STARTED (SDK)")
+                    }
+
+                    override fun onFailure(error: IDJIError) {
+                        isRecording = false
+                        logToUi("Failed to start recording: ${error.errorCode()} ${error.description()}")
+                        debugCameraBlock("StartRecord", error)
+                    }
+                }
+            )
+        }
     }
 
+
     private fun stopRecordingToSd() {
+        if (!isRecording) {
+            logToUi("Stop recording requested, but isRecording=false → skipping SDK stop.")
+            return
+        }
+
         logToUi("Stop recording requested…")
 
-        val cameraIndex = 0
-
         val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
-            KeyTools.createKey(KeyStopRecord, cameraIndex)
+            KeyTools.createKey(CameraKey.KeyStopRecord, cameraIndex)
 
         KeyManager.getInstance().performAction(
             actionKey,
@@ -838,33 +985,112 @@ class TouchFlyActivity : AppCompatActivity() {
 
                 override fun onFailure(error: IDJIError) {
                     logToUi("Failed to stop recording: ${error.errorCode()} ${error.description()}")
+                    debugCameraBlock("StopRecord", error)
                 }
             }
         )
     }
+
 
     private fun takePhotoToSd() {
         logToUi("Photo capture requested…")
+        KeyManager.getInstance().getValue(
+            shootPhotoNotAllowedKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<Boolean> {
+                override fun onSuccess(notAllowed: Boolean) {
+                    if (notAllowed) {
+                        logToUi("PHOTO blocked: ShootPhotoNotAllowed=true (camera says no).")
+                        return
+                    }
 
-        val cameraIndex = 0
+                    setCameraMode(CameraMode.PHOTO_NORMAL) { ok, err ->
+                        if (!ok) {
+                            logToUi(
+                                "Cannot shoot photo, camera mode change failed: " +
+                                        "${err?.errorCode()} ${err?.description()}"
+                            )
+                            return@setCameraMode
+                        }
 
-        val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
-            KeyTools.createKey(CameraKey.KeyStartShootPhoto, cameraIndex)
+                        val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
+                            KeyTools.createKey(CameraKey.KeyStartShootPhoto, cameraIndex)
 
-        KeyManager.getInstance().performAction(
-            actionKey,
-            EmptyMsg(),
-            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
-                override fun onSuccess(result: EmptyMsg?) {
-                    logToUi("PHOTO captured (SDK)")
+                        KeyManager.getInstance().performAction(
+                            actionKey,
+                            EmptyMsg(),
+                            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
+                                override fun onSuccess(result: EmptyMsg?) {
+                                    logToUi("PHOTO captured (SDK)")
+                                }
+
+                                override fun onFailure(error: IDJIError) {
+                                    logToUi(
+                                        "Failed to capture photo: " +
+                                                "${error.errorCode()} ${error.description()}"
+                                    )
+                                    debugCameraBlock("ShootPhoto", error)
+                                }
+                            }
+                        )
+                    }
                 }
 
                 override fun onFailure(error: IDJIError) {
-                    logToUi("Failed to capture photo: ${error.errorCode()} ${error.description()}")
+                    logToUi(
+                        "PHOTO pre-check failed (cannot read ShootPhotoNotAllowed): " +
+                                "${error.errorCode()} ${error.description()}"
+                    )
                 }
             }
         )
     }
+
+
+    private fun debugCameraBlock(context: String, error: IDJIError) {
+        logToUi("$context FAILED: ${error.errorCode()} ${error.description()}")
+
+        val gpsKey: DJIKey<GPSSignalLevel> =
+            KeyTools.createKey(FlightControllerKey.KeyGPSSignalLevel)
+
+        KeyManager.getInstance().getValue(
+            gpsKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<GPSSignalLevel> {
+                override fun onSuccess(value: GPSSignalLevel) {
+                    logToUi(
+                        "$context debug: GPSSignalLevel = ${value.name} " +
+                                "(ordinal=${value.ordinal})"
+                    )
+                }
+
+                override fun onFailure(e: IDJIError) {
+                    logToUi(
+                        "$context debug: Failed to read GPSSignalLevel: " +
+                                "${e.errorCode()} ${e.description()}"
+                    )
+                }
+            }
+        )
+
+        val homeKey: DJIKey<Boolean> = KeyTools.createKey(FlightControllerKey.KeyIsHomeLocationSet)
+
+        KeyManager.getInstance().getValue(
+            homeKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<Boolean> {
+                override fun onSuccess(isSet: Boolean) {
+                    logToUi("$context debug: HomeLocationSet = $isSet")
+                }
+
+                override fun onFailure(e: IDJIError) {
+                    logToUi(
+                        "$context debug: Failed to read HomeLocationSet: " +
+                                "${e.errorCode()} ${e.description()}"
+                    )
+                }
+            }
+        )
+    }
+
+
 
 
     private fun startSdkTakeoff() {
@@ -1022,7 +1248,6 @@ class TouchFlyActivity : AppCompatActivity() {
             connectivityManager.registerDefaultNetworkCallback(cb)
             logToUi("PhoneNet: registered default network callback.")
         } else {
-            // Older devices: we just rely on the initial snapshot
             logToUi("PhoneNet: SDK < 24, using single activeNetwork snapshot only.")
         }
     }
@@ -1121,7 +1346,7 @@ class TouchFlyActivity : AppCompatActivity() {
         sendHandler.postDelayed({
             yawInput = 0.0
             updateJoystickFromInputs()
-        }, 200L)
+        }, 250L)
     }
 
     private fun setIndicatorActive(view: View, active: Boolean) {
@@ -1261,7 +1486,6 @@ class TouchFlyActivity : AppCompatActivity() {
 
     /**
      * Map pilot's network (from browser WebRTC stats) to a LinkQualityLevel.
-     *
      * bitrateKbps: outgoing bitrate from pilot to LiveKit.
      * rttMs: round-trip time in ms.
      */
@@ -1488,18 +1712,18 @@ class TouchFlyActivity : AppCompatActivity() {
             "SHIFT" -> throttleInput = -delta // down
 
 
-            "A" -> if (down) nudgeYaw(-0.5) // left yaw increment
-            "D" -> if (down) nudgeYaw(+0.5) // right yaw increment
+            "A" -> if (down) nudgeYaw(-0.8) // left yaw increment
+            "D" -> if (down) nudgeYaw(+0.8) // right yaw increment
 
 
             "W" -> if (down) {
                 adjustGimbalPitch(+2.0)  // tilt camera up
-                gimbalLevel = (gimbalLevel + 0.1).coerceIn(-1.0, 1.0)
+                gimbalLevel = (gimbalLevel + 0.05).coerceIn(-1.0, 1.0)
                 runOnUiThread { updateGimbalSliderUi() }
             }
             "S" -> if (down) {
                 adjustGimbalPitch(-2.0)  // tilt camera down
-                gimbalLevel = (gimbalLevel - 0.1).coerceIn(-1.0, 1.0)
+                gimbalLevel = (gimbalLevel - 0.05).coerceIn(-1.0, 1.0)
                 runOnUiThread { updateGimbalSliderUi() }
             }
 
@@ -1527,14 +1751,20 @@ class TouchFlyActivity : AppCompatActivity() {
             }
             "N", "KEYN" -> if(down){
                 logToUi("Pilot requested START RECORDING (N)")
+//                runOnUiThread { uxRecordWidget.performClick() }
                 startRecordingToSd()
             }
             "M","KEYM" -> if(down){
                 logToUi("Pilot requested STOP RECORDING (M)")
+//                runOnUiThread { uxRecordWidget.performClick() }
+
                 stopRecordingToSd()
+
             }
             "P","KEYP" -> if(down){
                 logToUi("Pilot requested PHOTO CAPTURE (P)")
+//                runOnUiThread { uxShootWidget.performClick() }
+
                 takePhotoToSd()
             }
 
@@ -1582,6 +1812,12 @@ class TouchFlyActivity : AppCompatActivity() {
                     setIndicatorActive(indicatorRth, down)
                 "L", "KEYL" ->
                     setIndicatorActive(indicatorLand, down)
+                "N", "KEYN" ->
+                    setIndicatorActive(indicatorVideoStart, down)
+                "M", "KEYM" ->
+                    setIndicatorActive(indicatorVideoStop, down)
+                "P", "KEYP" ->
+                    setIndicatorActive(indicatorPicture, down)
             }
 
 

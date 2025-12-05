@@ -144,25 +144,39 @@
                     app:layout_constraintStart_toStartOf="parent"
                     app:layout_constraintTop_toBottomOf="@id/btn_start_stream" />
 
-
-                <Button
-                    android:id="@+id/btn_record_start"
-                    style="@style/main_fragment_btn"
-                    android:text="Record Start"
-                    android:layout_marginTop="8dp"
+                <dji.v5.ux.cameracore.widget.cameracapture.recordvideo.RecordVideoWidget
+                    android:id="@+id/ux_record_widget"
+                    android:layout_width="5dp"
+                    android:layout_height="5dp"
                     app:layout_constraintEnd_toEndOf="parent"
                     app:layout_constraintStart_toStartOf="parent"
-                    app:layout_constraintTop_toBottomOf="@id/btn_stop_stream" />
+                    app:layout_constraintTop_toBottomOf="@id/btn_start_stream"/>
 
-
-                <Button
-                    android:id="@+id/btn_record_stop"
-                    style="@style/main_fragment_btn"
-                    android:text="Record Stop"
-                    android:layout_marginTop="8dp"
+                <dji.v5.ux.cameracore.widget.cameracapture.shootphoto.ShootPhotoWidget
+                    android:id="@+id/ux_shoot_widget"
+                    android:layout_width="5dp"
+                    android:layout_height="5dp"
                     app:layout_constraintEnd_toEndOf="parent"
                     app:layout_constraintStart_toStartOf="parent"
-                    app:layout_constraintTop_toBottomOf="@id/btn_record_start" />
+                    app:layout_constraintTop_toBottomOf="@id/ux_record_widget"/>
+<!--                <Button-->
+<!--                    android:id="@+id/btn_record_start"-->
+<!--                    style="@style/main_fragment_btn"-->
+<!--                    android:text="Record Start"-->
+<!--                    android:layout_marginTop="8dp"-->
+<!--                    app:layout_constraintEnd_toEndOf="parent"-->
+<!--                    app:layout_constraintStart_toStartOf="parent"-->
+<!--                    app:layout_constraintTop_toBottomOf="@id/btn_stop_stream" />-->
+
+
+<!--                <Button-->
+<!--                    android:id="@+id/btn_record_stop"-->
+<!--                    style="@style/main_fragment_btn"-->
+<!--                    android:text="Record Stop"-->
+<!--                    android:layout_marginTop="8dp"-->
+<!--                    app:layout_constraintEnd_toEndOf="parent"-->
+<!--                    app:layout_constraintStart_toStartOf="parent"-->
+<!--                    app:layout_constraintTop_toBottomOf="@id/btn_record_start" />-->
 
             </androidx.constraintlayout.widget.ConstraintLayout>
         </androidx.core.widget.NestedScrollView>
@@ -271,7 +285,7 @@
 
 
         <!-- T / R / L indicators below the battery (column) -->
-        <!-- T / R / L indicators below the battery (column) -->
+
         <TextView
             android:id="@+id/indicator_takeoff"
             android:layout_width="36dp"
@@ -310,6 +324,43 @@
             app:layout_constraintTop_toBottomOf="@id/indicator_rth"
             app:layout_constraintEnd_toEndOf="@id/tv_battery"
             android:layout_marginTop="6dp" />
+        <TextView
+            android:id="@+id/indicator_video_start"
+            android:layout_width="30dp"
+            android:layout_height="30dp"
+            android:background="@drawable/indicator_circle"
+            android:text="N"
+            android:textSize="12sp"
+            android:textColor="@android:color/white"
+            android:gravity="center"
+            app:layout_constraintTop_toBottomOf="@id/indicator_land"
+            app:layout_constraintEnd_toEndOf="@id/tv_battery"
+            android:layout_marginTop="8dp" />
+        <TextView
+            android:id="@+id/indicator_video_stop"
+            android:layout_width="30dp"
+            android:layout_height="30dp"
+            android:background="@drawable/indicator_circle"
+            android:text="M"
+            android:textSize="12sp"
+            android:textColor="@android:color/white"
+            android:gravity="center"
+            app:layout_constraintTop_toBottomOf="@id/indicator_video_start"
+            app:layout_constraintEnd_toEndOf="@id/tv_battery"
+            android:layout_marginTop="6dp" />
+        <TextView
+            android:id="@+id/indicator_picture"
+            android:layout_width="30dp"
+            android:layout_height="30dp"
+            android:background="@drawable/indicator_circle"
+            android:text="P"
+            android:textSize="12sp"
+            android:textColor="@android:color/white"
+            android:gravity="center"
+            app:layout_constraintTop_toBottomOf="@id/indicator_video_stop"
+            app:layout_constraintEnd_toEndOf="@id/tv_battery"
+            android:layout_marginTop="6dp" />
+
 
         <TextView
             android:id="@+id/tvLogs"
@@ -345,17 +396,17 @@
 
         <View
             android:id="@+id/gimbal_slider_track"
-            android:layout_width="14dp"
-            android:layout_height="175dp"
+            android:layout_width="16dp"
+            android:layout_height="180dp"
             android:background="#444444"
-            android:layout_marginBottom="8dp"
+            android:layout_marginBottom="4dp"
             android:layout_marginEnd="-30dp"
 
             app:layout_constraintEnd_toStartOf="@id/left_stick_view"
             app:layout_constraintBottom_toTopOf="@id/left_stick_view" />
         <View
             android:id="@+id/gimbal_slider_thumb"
-            android:layout_width="18dp"
+            android:layout_width="20dp"
             android:layout_height="10dp"
             android:background="#4DA3FF"
             app:layout_constraintStart_toStartOf="@id/gimbal_slider_track"
