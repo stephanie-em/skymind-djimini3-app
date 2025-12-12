@@ -23,8 +23,6 @@ import okhttp3.Request
 import org.json.JSONObject
 import dji.sampleV5.aircraft.virtualstick.OnScreenJoystick
 import dji.sampleV5.aircraft.virtualstick.OnScreenJoystickListener
-//import io.livekit.android.BuildConfig
-//import dji.sampleV5.aircraft.BuildConfig
 import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
@@ -64,11 +62,11 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import dji.sdk.keyvalue.value.camera.CameraMode
 import dji.sdk.keyvalue.value.flightcontroller.GPSSignalLevel
-import dji.sdk.keyvalue.value.camera.CameraStorageLocation
 
 
+const val BACKEND_BASE_URL = "https://skymind.live"
 private const val TAG = "TouchFly"
-
+private const val DEFAULT_ROOM_NAME = "taken out for git"
 enum class LinkQuality {
     GOOD, FAIR, POOR, CRITICAL
 }
@@ -79,8 +77,8 @@ class TouchFlyActivity : AppCompatActivity() {
     private var livekitRoom: Room? = null
     private val livekitScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 //livekit room variable taken out for git purposes
-
-
+    private val livekitUrl: String = "taken out for git"
+    private var currentRoomName: String = DEFAULT_ROOM_NAME
 
     // --- ui references (from frag_virtual_stick.xml) ---
     private lateinit var infoTv: TextView
@@ -90,12 +88,33 @@ class TouchFlyActivity : AppCompatActivity() {
     private lateinit var btnDisableVS: Button
     private var btnStop: Button? = null // reuse one of the other variables as stop?
     private lateinit var tvLogs: TextView
+    private lateinit var btnTakeOff: Button
+    private lateinit var btnRth: Button
+
+    private lateinit var btnLand: Button
+    private lateinit var btnStartStream: Button
+    private lateinit var btnStopStream: Button
+
+    private lateinit var btnRecordStart: Button
+    private lateinit var btnRecordStop: Button
+    private lateinit var batteryTv: TextView
+    private lateinit var batteryPercentKey: DJIKey<Int>
+
+    private lateinit var tvDroneLink: TextView
+    private lateinit var tvPhoneNet: TextView
+    private lateinit var tvPilotNet: TextView
+    private lateinit var rcConnectionKey: DJIKey<Boolean>
+    private lateinit var airlinkSignalQualityKey: DJIKey<Int>
+    private lateinit var connectivityManager: ConnectivityManager
+    private var phoneNetCallback: ConnectivityManager.NetworkCallback? = null
+
+    private var cleanMode: Boolean = false
+
 
     // --- DJI camera stream fields (reusing from LiveFragment.kt, simplified) ---
     private lateinit var cameraSurface: SurfaceView
     private lateinit var rootView: View
     private lateinit var controlsOverlay: View
-    private var cleanMode: Boolean = false
     private val cameraStreamManager = MediaDataCenter.getInstance().cameraStreamManager
     private var cameraStreamSurface: Surface? = null
     private var cameraStreamWidth = -1
@@ -104,6 +123,23 @@ class TouchFlyActivity : AppCompatActivity() {
         ICameraStreamManager.ScaleType.CENTER_INSIDE
     private var cameraIndex: ComponentIndexType = ComponentIndexType.LEFT_OR_MAIN
     private val mainLens: CameraLensType = CameraLensType.CAMERA_LENS_DEFAULT
+    private var zoomCurrent = 1.0
+    private var zoomMin = 1.0
+    private var zoomMax = 1.0
+
+    private lateinit var cameraZoomKey: DJIKey<Double>
+    private lateinit var cameraZoomRangeKey: DJIKey<ZoomRatiosRange>
+    private val shootPhotoNotAllowedKey: DJIKey<Boolean> =
+        KeyTools.createCameraKey(
+            CameraKey.KeyShootPhotoNotAllowed,
+            cameraIndex,
+            mainLens
+        )
+
+    private lateinit var gimbalTrack: View
+    private lateinit var gimbalThumb: View
+    private var gimbalLevel = 0.0
+
     private var isLocalLiveShow: Boolean = true
 
     // --- Flight status (GPS + home point) ---
@@ -130,34 +166,6 @@ class TouchFlyActivity : AppCompatActivity() {
     @Volatile
     private var sending = false
 
-    private lateinit var btnStartStream: Button
-    private lateinit var btnStopStream: Button
-//
-//    private lateinit var btnRecordStart: Button
-//    private lateinit var btnRecordStop: Button
-
-
-    private lateinit var btnTakeOff: Button
-    private lateinit var btnRth: Button
-
-    private lateinit var btnLand: Button
-    private var zoomCurrent = 1.0
-    private var zoomMin = 1.0
-    private var zoomMax = 1.0
-
-    private lateinit var cameraZoomKey: DJIKey<Double>
-    private lateinit var cameraZoomRangeKey: DJIKey<ZoomRatiosRange>
-
-    private lateinit var batteryTv: TextView
-    private lateinit var batteryPercentKey: DJIKey<Int>
-
-    private lateinit var tvDroneLink: TextView
-    private lateinit var tvPhoneNet: TextView
-    private lateinit var tvPilotNet: TextView
-    private lateinit var rcConnectionKey: DJIKey<Boolean>
-    private lateinit var airlinkSignalQualityKey: DJIKey<Int>
-    private lateinit var connectivityManager: ConnectivityManager
-    private var phoneNetCallback: ConnectivityManager.NetworkCallback? = null
     // key indicator views
     private lateinit var indicatorZoomIn: View
     private lateinit var indicatorZoomOut: View
@@ -170,17 +178,6 @@ class TouchFlyActivity : AppCompatActivity() {
 
     private lateinit var indicatorPicture: View
 
-    private val shootPhotoNotAllowedKey: DJIKey<Boolean> =
-        KeyTools.createCameraKey(
-            CameraKey.KeyShootPhotoNotAllowed,
-            cameraIndex,
-            mainLens
-        )
-
-    private lateinit var gimbalTrack: View
-    private lateinit var gimbalThumb: View
-    private var gimbalLevel = 0.0
-
 
     @Volatile private var droneLinkQuality: LinkQuality = LinkQuality.GOOD
     @Volatile private var phoneNetQuality: LinkQuality = LinkQuality.GOOD
@@ -190,8 +187,6 @@ class TouchFlyActivity : AppCompatActivity() {
     private var isScreenShareOn = false
     @Volatile
     private var isRecording = false
-
-
     @Volatile private var lastPilotControlMs: Long = 0L
     @Volatile private var lastPilotHeartbeatMs: Long = 0L
     @Volatile private var rthTriggeredForCritical = false
@@ -293,6 +288,144 @@ class TouchFlyActivity : AppCompatActivity() {
             }
         }
     }
+
+    // --- DJI camera preview wiring (hardened + logged) ---
+    private fun initCameraStreamPreview() {
+        logToUi("initCameraStreamPreview: attaching SurfaceHolder.Callback")
+
+        cameraSurface.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                logToUi("Surface CREATED for camera preview")
+                cameraStreamWidth = holder.surfaceFrame.width()
+                cameraStreamHeight = holder.surfaceFrame.height()
+                cameraStreamSurface = holder.surface
+                putCameraStreamSurface("surfaceCreated")
+            }
+
+            override fun surfaceChanged(
+                holder: SurfaceHolder,
+                format: Int,
+                width: Int,
+                height: Int
+            ) {
+                logToUi("Surface CHANGED: w=$width h=$height fmt=$format")
+                cameraStreamWidth = width
+                cameraStreamHeight = height
+                cameraStreamSurface = holder.surface
+                putCameraStreamSurface("surfaceChanged")
+            }
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                logToUi("Surface DESTROYED, removing camera stream surface")
+                try {
+                    cameraStreamManager.removeCameraStreamSurface(holder.surface)
+                } catch (e: Exception) {
+                    logToUi("removeCameraStreamSurface in surfaceDestroyed failed: ${e.message}")
+                }
+            }
+        })
+
+        // always show local live
+        isLocalLiveShow = true
+
+        // Set default camera index (main camera)
+        cameraIndex = ComponentIndexType.LEFT_OR_MAIN
+        logToUi("initCameraStreamPreview: cameraIndex set to $cameraIndex")
+
+        // If the SurfaceView is already laid out when we arrive, force an attach anyway.
+        cameraSurface.post {
+            val w = cameraSurface.width
+            val h = cameraSurface.height
+            if (w > 0 && h > 0) {
+                cameraStreamWidth = w
+                cameraStreamHeight = h
+                cameraStreamSurface = cameraSurface.holder.surface
+                logToUi("initCameraStreamPreview: post() attach w=$w h=$h")
+                putCameraStreamSurface("init-post")
+            } else {
+                logToUi("initCameraStreamPreview: post() w/h are 0, will rely on callbacks")
+            }
+        }
+    }
+
+    // Tell DJI to draw the selected camera into SurfaceView
+    private fun putCameraStreamSurface(from: String) {
+        logToUi(
+            "putCameraStreamSurface(from=$from) " +
+                    "isLocalLiveShow=$isLocalLiveShow " +
+                    "cameraIndex=$cameraIndex " +
+                    "w=$cameraStreamWidth h=$cameraStreamHeight " +
+                    "surfaceIsNull=${cameraStreamSurface == null}"
+        )
+
+        if (!isLocalLiveShow) {
+            logToUi("putCameraStreamSurface: local live show disabled, returning")
+            return
+        }
+        if (cameraIndex == ComponentIndexType.UNKNOWN) {
+            logToUi("putCameraStreamSurface: cameraIndex UNKNOWN, returning")
+            return
+        }
+
+        cameraStreamSurface?.let { surface ->
+            //clear any old binding on this surface before reattaching
+            try {
+                cameraStreamManager.removeCameraStreamSurface(surface)
+            } catch (_: Exception) {
+            }
+
+            cameraStreamManager.putCameraStreamSurface(
+                cameraIndex,
+                surface,
+                cameraStreamWidth,
+                cameraStreamHeight,
+                cameraStreamScaleType
+            )
+            logToUi("Camera stream attached OK: $cameraIndex ${cameraStreamWidth}x$cameraStreamHeight")
+        } ?: run {
+            logToUi("putCameraStreamSurface: surface is NULL, can't attach")
+        }
+    }
+
+
+    //Remove this surface from DJI camera stream manager
+    private fun removeCameraStreamSurface() {
+        cameraStreamSurface?.let {
+            cameraStreamManager.removeCameraStreamSurface(it)
+        }
+    }
+
+    private fun setCameraMode(
+        mode: CameraMode,
+        onDone: (Boolean, IDJIError?) -> Unit
+    ) {
+        // *******for mini 4 pro: use camera + lens specific key
+        val modeKey: DJIKey<CameraMode> = KeyTools.createCameraKey(
+            CameraKey.KeyCameraMode,
+            cameraIndex,
+            mainLens
+        )
+
+        KeyManager.getInstance().setValue(
+            modeKey,
+            mode,
+            object : CommonCallbacks.CompletionCallback {
+                override fun onSuccess() {
+                    logToUi("Camera mode set to $mode (index=$cameraIndex, lens=$mainLens)")
+                    onDone(true, null)
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi(
+                        "Failed to set camera mode to $mode: " +
+                                "${error.errorCode()} ${error.description()}"
+                    )
+                    onDone(false, error)
+                }
+            }
+        )
+    }
+
 
     // HTTP client for token
     private val http = OkHttpClient()
@@ -606,596 +739,6 @@ class TouchFlyActivity : AppCompatActivity() {
         }
     }
 
-
-
-    private fun startSafetyLoop() {
-        if (safetyLoopStarted) return
-        safetyLoopStarted = true
-
-        val task = object : Runnable {
-            override fun run() {
-                val now = System.currentTimeMillis()
-
-                //dead man timeout
-                if (sending) {
-                    val sinceControl = now - lastPilotControlMs
-                    if (sinceControl > DEADMAN_TIMEOUT_MS &&
-                        (pitchInput != 0.0 || rollInput != 0.0 || yawInput != 0.0 || throttleInput != 0.0)
-                    ) {
-                        pitchInput = 0.0
-                        rollInput = 0.0
-                        yawInput = 0.0
-                        throttleInput = 0.0
-
-                        logToUi(
-                            "SAFETY: no pilot control for ${sinceControl}ms → " +
-                                    "neutral sticks (hover)."
-                        )
-
-                        runOnUiThread {
-                            updateJoystickFromInputs()
-                        }
-                    }
-                }
-
-                // messages from pilot
-                val sinceHeartbeat = now - lastPilotHeartbeatMs
-                if (sinceHeartbeat > HEARTBEAT_LOST_MS) {
-                    if (pilotNetQuality != LinkQuality.CRITICAL) {
-                        pilotNetQuality = LinkQuality.CRITICAL
-                        runOnUiThread {
-                            setQualityLabel(
-                                tvPilotNet,
-                                "PILOT NET: LOST (${sinceHeartbeat / 1000}s)",
-                                LinkQuality.CRITICAL
-                            )
-                        }
-                        logToUi("SAFETY: pilot heartbeat lost for ${sinceHeartbeat}ms.")
-                    }
-                }
-
-                //link connection
-                val worst = worstLinkQuality()
-
-                // If link degraded to POOR or worse, force hover
-                if (sending && (worst == LinkQuality.POOR || worst == LinkQuality.CRITICAL)) {
-                    if (pitchInput != 0.0 || rollInput != 0.0 ||
-                        yawInput != 0.0 || throttleInput != 0.0
-                    ) {
-                        pitchInput = 0.0
-                        rollInput = 0.0
-                        yawInput = 0.0
-                        throttleInput = 0.0
-
-                        logToUi("SAFETY: worst link=$worst → forcing hover.")
-                        runOnUiThread { updateJoystickFromInputs() }
-                    }
-                }
-
-                // Track how long we’ve been in CRITICAL
-                if (worst == LinkQuality.CRITICAL) {
-                    if (firstCriticalSeenAtMs == 0L) {
-                        firstCriticalSeenAtMs = now
-                    }
-                    val inCriticalMs = now - firstCriticalSeenAtMs
-
-                    if (!rthTriggeredForCritical && inCriticalMs >= RTH_CRITICAL_HOLD_MS) {
-                        logToUi(
-                            "SAFETY: worst link CRITICAL for ${inCriticalMs}ms → " +
-                                    "auto Return-to-Home."
-                        )
-                        startSdkReturnToHome()
-                        rthTriggeredForCritical = true
-                    }
-                } else {
-                    // reset when we leave CRITICAL
-                    firstCriticalSeenAtMs = 0L
-                    rthTriggeredForCritical = false
-                }
-
-                // schedule next check
-                safetyHandler.postDelayed(this, 200L) // 5 Hz
-            }
-        }
-
-        safetyHandler.post(task)
-    }
-
-
-    // --- DJI camera preview wiring (hardened + logged) ---
-    private fun initCameraStreamPreview() {
-        logToUi("initCameraStreamPreview: attaching SurfaceHolder.Callback")
-
-        cameraSurface.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                logToUi("Surface CREATED for camera preview")
-                cameraStreamWidth = holder.surfaceFrame.width()
-                cameraStreamHeight = holder.surfaceFrame.height()
-                cameraStreamSurface = holder.surface
-                putCameraStreamSurface("surfaceCreated")
-            }
-
-            override fun surfaceChanged(
-                holder: SurfaceHolder,
-                format: Int,
-                width: Int,
-                height: Int
-            ) {
-                logToUi("Surface CHANGED: w=$width h=$height fmt=$format")
-                cameraStreamWidth = width
-                cameraStreamHeight = height
-                cameraStreamSurface = holder.surface
-                putCameraStreamSurface("surfaceChanged")
-            }
-
-            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                logToUi("Surface DESTROYED, removing camera stream surface")
-                try {
-                    cameraStreamManager.removeCameraStreamSurface(holder.surface)
-                } catch (e: Exception) {
-                    logToUi("removeCameraStreamSurface in surfaceDestroyed failed: ${e.message}")
-                }
-            }
-        })
-
-        // always show local live
-        isLocalLiveShow = true
-
-        // Set default camera index (main camera)
-        cameraIndex = ComponentIndexType.LEFT_OR_MAIN
-        logToUi("initCameraStreamPreview: cameraIndex set to $cameraIndex")
-
-        // If the SurfaceView is already laid out when we arrive, force an attach anyway.
-        cameraSurface.post {
-            val w = cameraSurface.width
-            val h = cameraSurface.height
-            if (w > 0 && h > 0) {
-                cameraStreamWidth = w
-                cameraStreamHeight = h
-                cameraStreamSurface = cameraSurface.holder.surface
-                logToUi("initCameraStreamPreview: post() attach w=$w h=$h")
-                putCameraStreamSurface("init-post")
-            } else {
-                logToUi("initCameraStreamPreview: post() w/h are 0, will rely on callbacks")
-            }
-        }
-    }
-
-    // Tell DJI to draw the selected camera into SurfaceView
-    private fun putCameraStreamSurface(from: String) {
-        logToUi(
-            "putCameraStreamSurface(from=$from) " +
-                    "isLocalLiveShow=$isLocalLiveShow " +
-                    "cameraIndex=$cameraIndex " +
-                    "w=$cameraStreamWidth h=$cameraStreamHeight " +
-                    "surfaceIsNull=${cameraStreamSurface == null}"
-        )
-
-        if (!isLocalLiveShow) {
-            logToUi("putCameraStreamSurface: local live show disabled, returning")
-            return
-        }
-        if (cameraIndex == ComponentIndexType.UNKNOWN) {
-            logToUi("putCameraStreamSurface: cameraIndex UNKNOWN, returning")
-            return
-        }
-
-        cameraStreamSurface?.let { surface ->
-            //clear any old binding on this surface before reattaching
-            try {
-                cameraStreamManager.removeCameraStreamSurface(surface)
-            } catch (_: Exception) {
-            }
-
-            cameraStreamManager.putCameraStreamSurface(
-                cameraIndex,
-                surface,
-                cameraStreamWidth,
-                cameraStreamHeight,
-                cameraStreamScaleType
-            )
-            logToUi("Camera stream attached OK: $cameraIndex ${cameraStreamWidth}x$cameraStreamHeight")
-        } ?: run {
-            logToUi("putCameraStreamSurface: surface is NULL, can't attach")
-        }
-    }
-
-
-    //Remove this surface from DJI camera stream manager
-    private fun removeCameraStreamSurface() {
-        cameraStreamSurface?.let {
-            cameraStreamManager.removeCameraStreamSurface(it)
-        }
-    }
-
-    private fun setCameraMode(
-        mode: CameraMode,
-        onDone: (Boolean, IDJIError?) -> Unit
-    ) {
-        // *******for mini 4 pro: use camera + lens specific key
-        val modeKey: DJIKey<CameraMode> = KeyTools.createCameraKey(
-            CameraKey.KeyCameraMode,
-            cameraIndex,
-            mainLens
-        )
-
-        KeyManager.getInstance().setValue(
-            modeKey,
-            mode,
-            object : CommonCallbacks.CompletionCallback {
-                override fun onSuccess() {
-                    logToUi("Camera mode set to $mode (index=$cameraIndex, lens=$mainLens)")
-                    onDone(true, null)
-                }
-
-                override fun onFailure(error: IDJIError) {
-                    logToUi(
-                        "Failed to set camera mode to $mode: " +
-                                "${error.errorCode()} ${error.description()}"
-                    )
-                    onDone(false, error)
-                }
-            }
-        )
-    }
-
-
-
-
-    // Helper: log to both Logcat and virtual_stick_info_tv
-    private fun logToUi(message: String) {
-        Log.d(TAG, message)
-
-        val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
-            .format(java.util.Date())
-        val line = "[$time] $message"
-
-        // Short status in virtual_stick_info_tv
-        infoTv.post {
-            val existing = infoTv.text?.toString().orEmpty()
-            val newText = if (existing.isEmpty()) line else "$existing\n$line"
-            infoTv.text = if (newText.length > 2000) newText.takeLast(2000) else newText
-        }
-
-        // Full log scroll in tvLogs
-        tvLogs.post {
-            tvLogs.append(line + "\n")
-            val layout = tvLogs.layout
-            if (layout != null) {
-                val scrollAmount = layout.getLineTop(tvLogs.lineCount) - tvLogs.height
-                if (scrollAmount > 0) tvLogs.scrollTo(0, scrollAmount) else tvLogs.scrollTo(0, 0)
-            }
-        }
-    }
-    private fun toggleCleanMode() {
-        cleanMode = !cleanMode
-
-        runOnUiThread {
-            val sidePanel = findViewById<View>(R.id.stick_button_list)
-            val infoText = findViewById<View>(R.id.virtual_stick_info_tv)
-            val simInfo = findViewById<View>(R.id.simulator_state_info_tv)
-            val hsi = findViewById<View>(R.id.widget_horizontal_situation_indicator)
-
-            if (cleanMode) {
-                //hide side panel + extra info, keep joysticks + logs
-                sidePanel.visibility = View.GONE
-                infoText.visibility = View.GONE
-                simInfo.visibility = View.GONE
-                hsi.visibility = View.GONE
-            } else {
-                //show everything again
-                sidePanel.visibility = View.VISIBLE
-                infoText.visibility = View.VISIBLE
-                simInfo.visibility = View.VISIBLE
-                hsi.visibility = View.VISIBLE
-            }
-        }
-
-        val msg = if (cleanMode) {
-            "Entered CLEAN MODE (joysticks + logs only)"
-        } else {
-            "Exited CLEAN MODE (full controls visible)"
-        }
-        Log.d(TAG, msg)
-        logToUi(msg)
-    }
-
-
-    private fun adjustGimbalPitch(deltaDegrees: Double) {
-        val rotation = GimbalAngleRotation().apply {
-            mode = GimbalAngleRotationMode.RELATIVE_ANGLE
-            pitch = deltaDegrees  // + up, - down
-            duration = 0.3
-        }
-
-        val actionKey: DJIKey.ActionKey<GimbalAngleRotation, EmptyMsg> =
-            KeyTools.createKey(GimbalKey.KeyRotateByAngle, 0)
-
-        KeyManager.getInstance().performAction<GimbalAngleRotation, EmptyMsg>(
-            actionKey,
-            rotation,
-            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
-                override fun onSuccess(result: EmptyMsg?) {
-                    logToUi("Gimbal pitch moved ${"%.1f".format(deltaDegrees)}°")
-                }
-
-                override fun onFailure(error: IDJIError) {
-                    logToUi(
-                        "GIMBAL ERROR: code=${error.errorCode()} msg=${error.description()}"
-                    )
-                }
-            }
-        )
-    }
-
-    private fun startRecordingToSd() {
-        logToUi("Start recording requested…")
-
-        setCameraMode(CameraMode.VIDEO_NORMAL) { ok, err ->
-            if (!ok) {
-                logToUi(
-                    "Cannot start recording, camera mode change failed: " +
-                            "${err?.errorCode()} ${err?.description()}"
-                )
-                return@setCameraMode
-            }
-
-            val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
-                KeyTools.createKey(CameraKey.KeyStartRecord, cameraIndex) //mainCameraIndex?
-
-            KeyManager.getInstance().performAction(
-                actionKey,
-                EmptyMsg(),
-                object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
-                    override fun onSuccess(result: EmptyMsg?) {
-                        isRecording = true
-                        logToUi("Recording STARTED (SDK)")
-                    }
-
-                    override fun onFailure(error: IDJIError) {
-                        isRecording = false
-                        logToUi("Failed to start recording: ${error.errorCode()} ${error.description()}")
-                        debugCameraBlock("StartRecord", error)
-                    }
-                }
-            )
-        }
-    }
-
-
-    private fun stopRecordingToSd() {
-        if (!isRecording) {
-            logToUi("Stop recording requested, but isRecording=false → skipping SDK stop.")
-            return
-        }
-
-        logToUi("Stop recording requested…")
-
-        val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
-            KeyTools.createKey(CameraKey.KeyStopRecord, cameraIndex)
-
-        KeyManager.getInstance().performAction(
-            actionKey,
-            EmptyMsg(),
-            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
-                override fun onSuccess(result: EmptyMsg?) {
-                    isRecording = false
-                    logToUi("Recording STOPPED (SDK)")
-                }
-
-                override fun onFailure(error: IDJIError) {
-                    logToUi("Failed to stop recording: ${error.errorCode()} ${error.description()}")
-                    debugCameraBlock("StopRecord", error)
-                }
-            }
-        )
-    }
-
-
-    private fun takePhotoToSd() {
-        logToUi("Photo capture requested…")
-        KeyManager.getInstance().getValue(
-            shootPhotoNotAllowedKey,
-            object : CommonCallbacks.CompletionCallbackWithParam<Boolean> {
-                override fun onSuccess(notAllowed: Boolean) {
-                    if (notAllowed) {
-                        logToUi("PHOTO blocked: ShootPhotoNotAllowed=true (camera says no).")
-                        return
-                    }
-
-                    setCameraMode(CameraMode.PHOTO_NORMAL) { ok, err ->
-                        if (!ok) {
-                            logToUi(
-                                "Cannot shoot photo, camera mode change failed: " +
-                                        "${err?.errorCode()} ${err?.description()}"
-                            )
-                            return@setCameraMode
-                        }
-
-                        val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
-                            KeyTools.createKey(CameraKey.KeyStartShootPhoto, cameraIndex)
-
-                        KeyManager.getInstance().performAction(
-                            actionKey,
-                            EmptyMsg(),
-                            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
-                                override fun onSuccess(result: EmptyMsg?) {
-                                    logToUi("PHOTO captured (SDK)")
-                                }
-
-                                override fun onFailure(error: IDJIError) {
-                                    logToUi(
-                                        "Failed to capture photo: " +
-                                                "${error.errorCode()} ${error.description()}"
-                                    )
-                                    debugCameraBlock("ShootPhoto", error)
-                                }
-                            }
-                        )
-                    }
-                }
-
-                override fun onFailure(error: IDJIError) {
-                    logToUi(
-                        "PHOTO pre-check failed (cannot read ShootPhotoNotAllowed): " +
-                                "${error.errorCode()} ${error.description()}"
-                    )
-                }
-            }
-        )
-    }
-
-
-    private fun debugCameraBlock(context: String, error: IDJIError) {
-        logToUi("$context FAILED: ${error.errorCode()} ${error.description()}")
-
-        val gpsKey: DJIKey<GPSSignalLevel> =
-            KeyTools.createKey(FlightControllerKey.KeyGPSSignalLevel)
-
-        KeyManager.getInstance().getValue(
-            gpsKey,
-            object : CommonCallbacks.CompletionCallbackWithParam<GPSSignalLevel> {
-                override fun onSuccess(value: GPSSignalLevel) {
-                    logToUi(
-                        "$context debug: GPSSignalLevel = ${value.name} " +
-                                "(ordinal=${value.ordinal})"
-                    )
-                }
-
-                override fun onFailure(e: IDJIError) {
-                    logToUi(
-                        "$context debug: Failed to read GPSSignalLevel: " +
-                                "${e.errorCode()} ${e.description()}"
-                    )
-                }
-            }
-        )
-
-        val homeKey: DJIKey<Boolean> = KeyTools.createKey(FlightControllerKey.KeyIsHomeLocationSet)
-
-        KeyManager.getInstance().getValue(
-            homeKey,
-            object : CommonCallbacks.CompletionCallbackWithParam<Boolean> {
-                override fun onSuccess(isSet: Boolean) {
-                    logToUi("$context debug: HomeLocationSet = $isSet")
-                }
-
-                override fun onFailure(e: IDJIError) {
-                    logToUi(
-                        "$context debug: Failed to read HomeLocationSet: " +
-                                "${e.errorCode()} ${e.description()}"
-                    )
-                }
-            }
-        )
-    }
-
-
-
-
-    private fun startSdkTakeoff() {
-        logToUi("Takeoff requested (FlightControllerKey.KeyStartTakeoff)…")
-
-        val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
-            KeyTools.createKey(FlightControllerKey.KeyStartTakeoff)
-
-        KeyManager.getInstance().performAction(
-            actionKey,
-            EmptyMsg(),
-            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
-                override fun onSuccess(result: EmptyMsg?) {
-                    logToUi("TAKEOFF command sent successfully.")
-                }
-
-                override fun onFailure(error: IDJIError) {
-                    logToUi("TAKEOFF FAILED: ${error.errorCode()} ${error.description()}")
-                }
-            }
-        )
-    }
-
-    private fun startSdkLanding() {
-        logToUi("Landing requested via FlightControllerKey.KeyStartAutoLanding (et)…")
-
-        FlightControllerKey.KeyStartAutoLanding.create().action(
-            { result: EmptyMsg ->
-                logToUi("AUTO-LANDING command sent successfully. $result")
-            },
-            { e: IDJIError ->
-                logToUi("AUTO-LANDING FAILED: ${e.errorCode()} ${e.description()}")
-            }
-        )
-    }
-
-    private fun startSdkReturnToHome() {
-        logToUi("Return-to-Home requested via FlightControllerKey.KeyStartGoHome…")
-
-        FlightControllerKey.KeyStartGoHome.create().action(
-            { result: EmptyMsg ->
-                logToUi("GO HOME command sent successfully. $result")
-            },
-            { e: IDJIError ->
-                logToUi("GO HOME FAILED: ${e.errorCode()} ${e.description()}")
-            }
-        )
-    }
-
-
-    private fun initZoomControls() {
-        cameraZoomKey = KeyTools.createCameraKey(
-            CameraKey.KeyCameraZoomRatios,
-            cameraIndex,
-            CameraLensType.CAMERA_LENS_DEFAULT
-        )
-        cameraZoomRangeKey = KeyTools.createCameraKey(
-            CameraKey.KeyCameraZoomRatiosRange,
-            cameraIndex,
-            CameraLensType.CAMERA_LENS_DEFAULT
-        )
-
-        // Get zoom range (min/max)
-        KeyManager.getInstance().getValue(
-            cameraZoomRangeKey,
-            object : CommonCallbacks.CompletionCallbackWithParam<ZoomRatiosRange> {
-                override fun onSuccess(range: ZoomRatiosRange) {
-                    val gears = range.gears
-                    if (gears != null && gears.isNotEmpty()) {
-                        zoomMin = gears.first().toDouble()
-                        zoomMax = gears.last().toDouble()
-                    } else {
-                        // fallback if gears is empty
-                        zoomMin = 1.0
-                        zoomMax = 2.0
-                    }
-                    logToUi("Zoom range from SDK: $zoomMin – $zoomMax")
-                }
-
-                override fun onFailure(error: IDJIError) {
-                    logToUi(
-                        "Zoom range not available: ${error.errorCode()} ${error.description()}"
-                    )
-                }
-            }
-        )
-
-        //read current zoom
-        KeyManager.getInstance().getValue(
-            cameraZoomKey,
-            object : CommonCallbacks.CompletionCallbackWithParam<Double> {
-                override fun onSuccess(value: Double) {
-                    zoomCurrent = value
-                    logToUi("Initial zoom ratio: x${"%.2f".format(zoomCurrent)}")
-                }
-
-                override fun onFailure(error: IDJIError) {
-                    logToUi(
-                        "Failed to read current zoom: ${error.errorCode()} ${error.description()}"
-                    )
-                }
-            }
-        )
-    }
-
     private fun initPhoneNetMonitoring() {
         connectivityManager =
             getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -1252,112 +795,48 @@ class TouchFlyActivity : AppCompatActivity() {
         }
     }
 
+    private fun debugCameraBlock(context: String, error: IDJIError) {
+        logToUi("$context FAILED: ${error.errorCode()} ${error.description()}")
 
-    private fun changeZoom(step: Double) {
-        val target = (zoomCurrent + step).coerceIn(zoomMin, zoomMax)
+        val gpsKey: DJIKey<GPSSignalLevel> =
+            KeyTools.createKey(FlightControllerKey.KeyGPSSignalLevel)
 
-        KeyManager.getInstance().setValue(
-            cameraZoomKey,
-            target,
-            object : CommonCallbacks.CompletionCallback {
-                override fun onSuccess() {
-                    zoomCurrent = target
-                    logToUi("Zoom set to x${"%.2f".format(target)}")
+        KeyManager.getInstance().getValue(
+            gpsKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<GPSSignalLevel> {
+                override fun onSuccess(value: GPSSignalLevel) {
+                    logToUi(
+                        "$context debug: GPSSignalLevel = ${value.name} " +
+                                "(ordinal=${value.ordinal})"
+                    )
                 }
 
-                override fun onFailure(error: IDJIError) {
+                override fun onFailure(e: IDJIError) {
                     logToUi(
-                        "Zoom FAILED: ${error.errorCode()} ${error.description()}"
+                        "$context debug: Failed to read GPSSignalLevel: " +
+                                "${e.errorCode()} ${e.description()}"
                     )
                 }
             }
         )
-    }
 
-    private fun zoomIn() {
-        changeZoom(+0.2)
-    }
+        val homeKey: DJIKey<Boolean> = KeyTools.createKey(FlightControllerKey.KeyIsHomeLocationSet)
 
-    private fun zoomOut() {
-        changeZoom(-0.2)
-    }
-
-    private fun updateGimbalSliderUi() {
-        val trackH = gimbalTrack.height
-        val thumbH = gimbalThumb.height
-        if (trackH == 0 || thumbH == 0) {
-            // wait until layout is done
-            gimbalTrack.post { updateGimbalSliderUi() }
-            return
-        }
-
-        // map gimbalLevel [-1,1] -> [0, trackH - thumbH]
-        val travel = (trackH - thumbH).toFloat()
-        val normalized = ((-gimbalLevel + 1.0) / 2.0)
-            .toFloat()
-            .coerceIn(0f, 1f)
-
-        val offsetPx = normalized * travel
-        gimbalThumb.translationY = offsetPx
-    }
-
-
-    private fun initBatteryPercentage() {
-        batteryPercentKey = KeyTools.createKey(
-            BatteryKey.KeyChargeRemainingInPercent,
-            0
-        )
-
-        // Get initial value
         KeyManager.getInstance().getValue(
-            batteryPercentKey,
-            object : CommonCallbacks.CompletionCallbackWithParam<Int> {
-                override fun onSuccess(value: Int) {
-                    updateBatteryUi(value)
+            homeKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<Boolean> {
+                override fun onSuccess(isSet: Boolean) {
+                    logToUi("$context debug: HomeLocationSet = $isSet")
                 }
 
-                override fun onFailure(error: IDJIError) {
-                    logToUi("Battery read failed: ${error.errorCode()} ${error.description()}")
+                override fun onFailure(e: IDJIError) {
+                    logToUi(
+                        "$context debug: Failed to read HomeLocationSet: " +
+                                "${e.errorCode()} ${e.description()}"
+                    )
                 }
             }
         )
-
-        //Subscribe for live updates
-        KeyManager.getInstance().listen(
-            batteryPercentKey,
-            this  // use Activity as listener tag
-        ) { _, newValue ->
-            newValue?.let { updateBatteryUi(it) }
-        }
-    }
-
-    private fun updateBatteryUi(percent: Int) {
-        runOnUiThread {
-            batteryTv.text = "Battery: $percent%"
-        }
-    }
-
-    private fun nudgeYaw(step: Double) {
-        // clamp just in case
-        yawInput = step.coerceIn(-1.0, 1.0)
-        updateJoystickFromInputs()
-
-        // after 200ms, reset yaw to 0 so it's just a small increment
-        sendHandler.postDelayed({
-            yawInput = 0.0
-            updateJoystickFromInputs()
-        }, 250L)
-    }
-
-    private fun setIndicatorActive(view: View, active: Boolean) {
-        val bg = view.background
-        if (bg is GradientDrawable) {
-            bg.mutate()
-            bg.setColor(
-                if (active) Color.parseColor("#4DA3FF") // ON (blue)
-                else Color.parseColor("#555555")        // OFF (gray)
-            )
-        }
     }
     private fun setQualityLabel(
         tv: TextView,
@@ -1525,11 +1004,523 @@ class TouchFlyActivity : AppCompatActivity() {
         }
     }
 
+    private fun startSafetyLoop() {
+        if (safetyLoopStarted) return
+        safetyLoopStarted = true
+
+        val task = object : Runnable {
+            override fun run() {
+                val now = System.currentTimeMillis()
+
+                //dead man timeout
+                if (sending) {
+                    val sinceControl = now - lastPilotControlMs
+                    if (sinceControl > DEADMAN_TIMEOUT_MS &&
+                        (pitchInput != 0.0 || rollInput != 0.0 || yawInput != 0.0 || throttleInput != 0.0)
+                    ) {
+                        pitchInput = 0.0
+                        rollInput = 0.0
+                        yawInput = 0.0
+                        throttleInput = 0.0
+
+                        logToUi(
+                            "SAFETY: no pilot control for ${sinceControl}ms → " +
+                                    "neutral sticks (hover)."
+                        )
+
+                        runOnUiThread {
+                            updateJoystickFromInputs()
+                        }
+                    }
+                }
+
+                // messages from pilot
+                val sinceHeartbeat = now - lastPilotHeartbeatMs
+                if (sinceHeartbeat > HEARTBEAT_LOST_MS) {
+                    if (pilotNetQuality != LinkQuality.CRITICAL) {
+                        pilotNetQuality = LinkQuality.CRITICAL
+                        runOnUiThread {
+                            setQualityLabel(
+                                tvPilotNet,
+                                "PILOT NET: LOST (${sinceHeartbeat / 1000}s)",
+                                LinkQuality.CRITICAL
+                            )
+                        }
+                        logToUi("SAFETY: pilot heartbeat lost for ${sinceHeartbeat}ms.")
+                    }
+                }
+
+                //link connection
+                val worst = worstLinkQuality()
+
+                // If link degraded to POOR or worse, force hover
+                if (sending && (worst == LinkQuality.POOR || worst == LinkQuality.CRITICAL)) {
+                    if (pitchInput != 0.0 || rollInput != 0.0 ||
+                        yawInput != 0.0 || throttleInput != 0.0
+                    ) {
+                        pitchInput = 0.0
+                        rollInput = 0.0
+                        yawInput = 0.0
+                        throttleInput = 0.0
+
+                        logToUi("SAFETY: worst link=$worst → forcing hover.")
+                        runOnUiThread { updateJoystickFromInputs() }
+                    }
+                }
+
+                // Track how long we’ve been in CRITICAL
+                if (worst == LinkQuality.CRITICAL) {
+                    if (firstCriticalSeenAtMs == 0L) {
+                        firstCriticalSeenAtMs = now
+                    }
+                    val inCriticalMs = now - firstCriticalSeenAtMs
+
+                    if (!rthTriggeredForCritical && inCriticalMs >= RTH_CRITICAL_HOLD_MS) {
+                        logToUi(
+                            "SAFETY: worst link CRITICAL for ${inCriticalMs}ms → " +
+                                    "auto Return-to-Home."
+                        )
+                        startSdkReturnToHome()
+                        rthTriggeredForCritical = true
+                    }
+                } else {
+                    // reset when we leave CRITICAL
+                    firstCriticalSeenAtMs = 0L
+                    rthTriggeredForCritical = false
+                }
+
+                // schedule next check
+                safetyHandler.postDelayed(this, 200L) // 5 Hz
+            }
+        }
+
+        safetyHandler.post(task)
+    }
 
 
 
 
 
+
+    // Helper: log to both Logcat and virtual_stick_info_tv
+    private fun logToUi(message: String) {
+        Log.d(TAG, message)
+
+        val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+            .format(java.util.Date())
+        val line = "[$time] $message"
+
+        // Short status in virtual_stick_info_tv
+        infoTv.post {
+            val existing = infoTv.text?.toString().orEmpty()
+            val newText = if (existing.isEmpty()) line else "$existing\n$line"
+            infoTv.text = if (newText.length > 2000) newText.takeLast(2000) else newText
+        }
+
+        // Full log scroll in tvLogs
+        tvLogs.post {
+            tvLogs.append(line + "\n")
+            val layout = tvLogs.layout
+            if (layout != null) {
+                val scrollAmount = layout.getLineTop(tvLogs.lineCount) - tvLogs.height
+                if (scrollAmount > 0) tvLogs.scrollTo(0, scrollAmount) else tvLogs.scrollTo(0, 0)
+            }
+        }
+    }
+    private fun toggleCleanMode() {
+        cleanMode = !cleanMode
+
+        runOnUiThread {
+            val sidePanel = findViewById<View>(R.id.stick_button_list)
+            val infoText = findViewById<View>(R.id.virtual_stick_info_tv)
+            val simInfo = findViewById<View>(R.id.simulator_state_info_tv)
+            val hsi = findViewById<View>(R.id.widget_horizontal_situation_indicator)
+
+            if (cleanMode) {
+                //hide side panel + extra info, keep joysticks + logs
+                sidePanel.visibility = View.GONE
+                infoText.visibility = View.GONE
+                simInfo.visibility = View.GONE
+                hsi.visibility = View.GONE
+            } else {
+                //show everything again
+                sidePanel.visibility = View.VISIBLE
+                infoText.visibility = View.VISIBLE
+                simInfo.visibility = View.VISIBLE
+                hsi.visibility = View.VISIBLE
+            }
+        }
+
+        val msg = if (cleanMode) {
+            "Entered CLEAN MODE (joysticks + logs only)"
+        } else {
+            "Exited CLEAN MODE (full controls visible)"
+        }
+        Log.d(TAG, msg)
+        logToUi(msg)
+    }
+
+
+
+
+    private fun startRecordingToSd() {
+        logToUi("Start recording requested…")
+
+        setCameraMode(CameraMode.VIDEO_NORMAL) { ok, err ->
+            if (!ok) {
+                logToUi(
+                    "Cannot start recording, camera mode change failed: " +
+                            "${err?.errorCode()} ${err?.description()}"
+                )
+                return@setCameraMode
+            }
+
+            val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
+                KeyTools.createKey(CameraKey.KeyStartRecord, cameraIndex) //mainCameraIndex?
+
+            KeyManager.getInstance().performAction(
+                actionKey,
+                EmptyMsg(),
+                object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
+                    override fun onSuccess(result: EmptyMsg?) {
+                        isRecording = true
+                        logToUi("Recording STARTED (SDK)")
+                    }
+
+                    override fun onFailure(error: IDJIError) {
+                        isRecording = false
+                        logToUi("Failed to start recording: ${error.errorCode()} ${error.description()}")
+                        debugCameraBlock("StartRecord", error)
+                    }
+                }
+            )
+        }
+    }
+
+
+    private fun stopRecordingToSd() {
+        if (!isRecording) {
+            logToUi("Stop recording requested, but isRecording=false → skipping SDK stop.")
+            return
+        }
+
+        logToUi("Stop recording requested…")
+
+        val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
+            KeyTools.createKey(CameraKey.KeyStopRecord, cameraIndex)
+
+        KeyManager.getInstance().performAction(
+            actionKey,
+            EmptyMsg(),
+            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
+                override fun onSuccess(result: EmptyMsg?) {
+                    isRecording = false
+                    logToUi("Recording STOPPED (SDK)")
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi("Failed to stop recording: ${error.errorCode()} ${error.description()}")
+                    debugCameraBlock("StopRecord", error)
+                }
+            }
+        )
+    }
+
+
+    private fun takePhotoToSd() {
+        logToUi("Photo capture requested…")
+        KeyManager.getInstance().getValue(
+            shootPhotoNotAllowedKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<Boolean> {
+                override fun onSuccess(notAllowed: Boolean) {
+                    if (notAllowed) {
+                        logToUi("PHOTO blocked: ShootPhotoNotAllowed=true (camera says no).")
+                        return
+                    }
+
+                    setCameraMode(CameraMode.PHOTO_NORMAL) { ok, err ->
+                        if (!ok) {
+                            logToUi(
+                                "Cannot shoot photo, camera mode change failed: " +
+                                        "${err?.errorCode()} ${err?.description()}"
+                            )
+                            return@setCameraMode
+                        }
+
+                        val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
+                            KeyTools.createKey(CameraKey.KeyStartShootPhoto, cameraIndex)
+
+                        KeyManager.getInstance().performAction(
+                            actionKey,
+                            EmptyMsg(),
+                            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
+                                override fun onSuccess(result: EmptyMsg?) {
+                                    logToUi("PHOTO captured (SDK)")
+                                }
+
+                                override fun onFailure(error: IDJIError) {
+                                    logToUi(
+                                        "Failed to capture photo: " +
+                                                "${error.errorCode()} ${error.description()}"
+                                    )
+                                    debugCameraBlock("ShootPhoto", error)
+                                }
+                            }
+                        )
+                    }
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi(
+                        "PHOTO pre-check failed (cannot read ShootPhotoNotAllowed): " +
+                                "${error.errorCode()} ${error.description()}"
+                    )
+                }
+            }
+        )
+    }
+
+
+
+
+    private fun startSdkTakeoff() {
+        logToUi("Takeoff requested (FlightControllerKey.KeyStartTakeoff)…")
+
+        val actionKey: DJIKey.ActionKey<EmptyMsg, EmptyMsg> =
+            KeyTools.createKey(FlightControllerKey.KeyStartTakeoff)
+
+        KeyManager.getInstance().performAction(
+            actionKey,
+            EmptyMsg(),
+            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
+                override fun onSuccess(result: EmptyMsg?) {
+                    logToUi("TAKEOFF command sent successfully.")
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi("TAKEOFF FAILED: ${error.errorCode()} ${error.description()}")
+                }
+            }
+        )
+    }
+
+    private fun startSdkLanding() {
+        logToUi("Landing requested via FlightControllerKey.KeyStartAutoLanding (et)…")
+
+        FlightControllerKey.KeyStartAutoLanding.create().action(
+            { result: EmptyMsg ->
+                logToUi("AUTO-LANDING command sent successfully. $result")
+            },
+            { e: IDJIError ->
+                logToUi("AUTO-LANDING FAILED: ${e.errorCode()} ${e.description()}")
+            }
+        )
+    }
+
+    private fun startSdkReturnToHome() {
+        logToUi("Return-to-Home requested via FlightControllerKey.KeyStartGoHome…")
+
+        FlightControllerKey.KeyStartGoHome.create().action(
+            { result: EmptyMsg ->
+                logToUi("GO HOME command sent successfully. $result")
+            },
+            { e: IDJIError ->
+                logToUi("GO HOME FAILED: ${e.errorCode()} ${e.description()}")
+            }
+        )
+    }
+
+
+    private fun initZoomControls() {
+        cameraZoomKey = KeyTools.createCameraKey(
+            CameraKey.KeyCameraZoomRatios,
+            cameraIndex,
+            CameraLensType.CAMERA_LENS_DEFAULT
+        )
+        cameraZoomRangeKey = KeyTools.createCameraKey(
+            CameraKey.KeyCameraZoomRatiosRange,
+            cameraIndex,
+            CameraLensType.CAMERA_LENS_DEFAULT
+        )
+
+        // Get zoom range (min/max)
+        KeyManager.getInstance().getValue(
+            cameraZoomRangeKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<ZoomRatiosRange> {
+                override fun onSuccess(range: ZoomRatiosRange) {
+                    val gears = range.gears
+                    if (gears != null && gears.isNotEmpty()) {
+                        zoomMin = gears.first().toDouble()
+                        zoomMax = gears.last().toDouble()
+                    } else {
+                        // fallback if gears is empty
+                        zoomMin = 1.0
+                        zoomMax = 2.0
+                    }
+                    logToUi("Zoom range from SDK: $zoomMin – $zoomMax")
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi(
+                        "Zoom range not available: ${error.errorCode()} ${error.description()}"
+                    )
+                }
+            }
+        )
+
+        //read current zoom
+        KeyManager.getInstance().getValue(
+            cameraZoomKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<Double> {
+                override fun onSuccess(value: Double) {
+                    zoomCurrent = value
+                    logToUi("Initial zoom ratio: x${"%.2f".format(zoomCurrent)}")
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi(
+                        "Failed to read current zoom: ${error.errorCode()} ${error.description()}"
+                    )
+                }
+            }
+        )
+    }
+
+
+
+
+    private fun changeZoom(step: Double) {
+        val target = (zoomCurrent + step).coerceIn(zoomMin, zoomMax)
+
+        KeyManager.getInstance().setValue(
+            cameraZoomKey,
+            target,
+            object : CommonCallbacks.CompletionCallback {
+                override fun onSuccess() {
+                    zoomCurrent = target
+                    logToUi("Zoom set to x${"%.2f".format(target)}")
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi(
+                        "Zoom FAILED: ${error.errorCode()} ${error.description()}"
+                    )
+                }
+            }
+        )
+    }
+
+    private fun zoomIn() {
+        changeZoom(+0.2)
+    }
+
+    private fun zoomOut() {
+        changeZoom(-0.2)
+    }
+    private fun adjustGimbalPitch(deltaDegrees: Double) {
+        val rotation = GimbalAngleRotation().apply {
+            mode = GimbalAngleRotationMode.RELATIVE_ANGLE
+            pitch = deltaDegrees  // + up, - down
+            duration = 0.3
+        }
+
+        val actionKey: DJIKey.ActionKey<GimbalAngleRotation, EmptyMsg> =
+            KeyTools.createKey(GimbalKey.KeyRotateByAngle, 0)
+
+        KeyManager.getInstance().performAction<GimbalAngleRotation, EmptyMsg>(
+            actionKey,
+            rotation,
+            object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
+                override fun onSuccess(result: EmptyMsg?) {
+                    logToUi("Gimbal pitch moved ${"%.1f".format(deltaDegrees)}°")
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi(
+                        "GIMBAL ERROR: code=${error.errorCode()} msg=${error.description()}"
+                    )
+                }
+            }
+        )
+    }
+
+    private fun updateGimbalSliderUi() {
+        val trackH = gimbalTrack.height
+        val thumbH = gimbalThumb.height
+        if (trackH == 0 || thumbH == 0) {
+            // wait until layout is done
+            gimbalTrack.post { updateGimbalSliderUi() }
+            return
+        }
+
+        // map gimbalLevel [-1,1] -> [0, trackH - thumbH]
+        val travel = (trackH - thumbH).toFloat()
+        val normalized = ((-gimbalLevel + 1.0) / 2.0)
+            .toFloat()
+            .coerceIn(0f, 1f)
+
+        val offsetPx = normalized * travel
+        gimbalThumb.translationY = offsetPx
+    }
+
+
+    private fun initBatteryPercentage() {
+        batteryPercentKey = KeyTools.createKey(
+            BatteryKey.KeyChargeRemainingInPercent,
+            0
+        )
+
+        // Get initial value
+        KeyManager.getInstance().getValue(
+            batteryPercentKey,
+            object : CommonCallbacks.CompletionCallbackWithParam<Int> {
+                override fun onSuccess(value: Int) {
+                    updateBatteryUi(value)
+                }
+
+                override fun onFailure(error: IDJIError) {
+                    logToUi("Battery read failed: ${error.errorCode()} ${error.description()}")
+                }
+            }
+        )
+
+        //Subscribe for live updates
+        KeyManager.getInstance().listen(
+            batteryPercentKey,
+            this  // use Activity as listener tag
+        ) { _, newValue ->
+            newValue?.let { updateBatteryUi(it) }
+        }
+    }
+
+    private fun updateBatteryUi(percent: Int) {
+        runOnUiThread {
+            batteryTv.text = "Battery: $percent%"
+        }
+    }
+
+    private fun nudgeYaw(step: Double) {
+        // clamp just in case
+        yawInput = step.coerceIn(-1.0, 1.0)
+        updateJoystickFromInputs()
+
+        // after 200ms, reset yaw to 0 so it's just a small increment
+        sendHandler.postDelayed({
+            yawInput = 0.0
+            updateJoystickFromInputs()
+        }, 250L)
+    }
+
+    private fun setIndicatorActive(view: View, active: Boolean) {
+        val bg = view.background
+        if (bg is GradientDrawable) {
+            bg.mutate()
+            bg.setColor(
+                if (active) Color.parseColor("#4DA3FF") // ON (blue)
+                else Color.parseColor("#555555")        // OFF (gray)
+            )
+        }
+    }
 
 
     private fun setupButtons() {
@@ -1585,7 +1576,7 @@ class TouchFlyActivity : AppCompatActivity() {
 
     private suspend fun fetchTokenFromServer(
         role: String = "android",
-        //room variable taken out for git
+        room: String = DEFAULT_ROOM_NAME,
     ): String? {
         val url = "https://skymind.live/api/token?role=$role&room=$room"
         val req = Request.Builder().url(url).get().build()
@@ -1611,7 +1602,7 @@ class TouchFlyActivity : AppCompatActivity() {
 
                 val token = tokenFromIntent ?: fetchTokenFromServer(
                     role = "android",
-                    //room name taken out for git
+                    room = DEFAULT_ROOM_NAME,
                 )
 
                 if (token.isNullOrBlank()) {
@@ -1936,3 +1927,4 @@ class TouchFlyActivity : AppCompatActivity() {
         })
     }
 }
+

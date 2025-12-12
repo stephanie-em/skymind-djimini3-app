@@ -45,6 +45,10 @@
         android:extractNativeLibs="true"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
 
+        <service
+            android:name=".MediaProjectionService"
+            android:foregroundServiceType="mediaProjection"
+            android:exported="false" />
         <meta-data
             android:name="com.dji.sdk.API_KEY"
             android:value="${API_KEY}"/>
